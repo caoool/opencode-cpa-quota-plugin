@@ -1,0 +1,49 @@
+{
+  "name": "opencode-cpa-quota-plugin",
+  "version": "0.1.0",
+  "description": "OpenCode TUI sidebar plugin for Codex, Claude, and Grok subscription quotas through CLI Proxy API.",
+  "type": "module",
+  "license": "MIT",
+  "author": "lu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/caoool/opencode-cpa-quota-plugin.git"
+  },
+  "homepage": "https://github.com/caoool/opencode-cpa-quota-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/caoool/opencode-cpa-quota-plugin/issues"
+  },
+  "exports": {
+    "./tui": "./dist/tui.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "esbuild index.tsx --bundle --format=esm --platform=node --target=es2022 --outfile=dist/tui.js --jsx=automatic --jsx-import-source=@opentui/solid --external:@opencode-ai/plugin --external:@opencode-ai/plugin/* --external:@opentui/core --external:@opentui/solid --external:@opentui/solid/* --external:solid-js --external:solid-js/*",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build",
+    "prepack": "npm run check"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.17.15",
+    "@opentui/core": ">=0.4.3",
+    "@opentui/solid": ">=0.4.3",
+    "solid-js": ">=1.9.12"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.17.15",
+    "@opentui/core": "0.4.3",
+    "@opentui/solid": "0.4.3",
+    "@types/node": "24.12.2",
+    "esbuild": "0.25.6",
+    "solid-js": "1.9.12",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=20",
+    "opencode": ">=1.17.15"
+  }
+}
