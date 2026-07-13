@@ -27,7 +27,7 @@ Add the package to `~/.config/opencode/tui.json`. OpenCode installs npm TUI plug
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
     [
-      "opencode-cpa-quota-plugin@0.2.0",
+      "opencode-cpa-quota-plugin",
       {
         "baseURL": "https://your-cpa.example.com",
         "managementKey": "your-management-key",
@@ -47,7 +47,7 @@ From your OpenCode configuration directory:
 
 ```sh
 cd ~/.config/opencode
-npm install github:caoool/opencode-cpa-quota-plugin#v0.2.0
+npm install github:caoool/opencode-cpa-quota-plugin#main
 ```
 
 Register the installed package directory in `~/.config/opencode/tui.json`:
