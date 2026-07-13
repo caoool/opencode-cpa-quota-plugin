@@ -2,6 +2,15 @@
   "name": "opencode-cpa-quota-plugin",
   "version": "0.1.0",
   "description": "OpenCode TUI sidebar plugin for Codex, Claude, and Grok subscription quotas through CLI Proxy API.",
+  "keywords": [
+    "opencode",
+    "tui",
+    "quota",
+    "codex",
+    "claude",
+    "grok",
+    "cli-proxy-api"
+  ],
   "type": "module",
   "license": "MIT",
   "author": "lu",
@@ -21,6 +30,9 @@
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "esbuild index.tsx --bundle --format=esm --platform=node --target=es2022 --outfile=dist/tui.js --jsx=automatic --jsx-import-source=@opentui/solid --external:@opencode-ai/plugin --external:@opencode-ai/plugin/* --external:@opentui/core --external:@opentui/solid --external:@opentui/solid/* --external:solid-js --external:solid-js/*",
     "typecheck": "tsc --noEmit",

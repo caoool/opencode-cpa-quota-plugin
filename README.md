@@ -18,6 +18,28 @@ An OpenCode TUI sidebar plugin that displays subscription quota usage for Codex,
 - A CLI Proxy API management endpoint and management key.
 - CPA auth files for the providers whose quotas you want to display.
 
+## Install from npm
+
+Add the package to `~/.config/opencode/tui.json`. OpenCode installs npm TUI plugins automatically:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    [
+      "opencode-cpa-quota-plugin@0.1.0",
+      {
+        "managementKeyEnv": "CPA_MANAGEMENT_KEY",
+        "refreshMs": 600000,
+        "planLabels": {
+          "claude": "Max"
+        }
+      }
+    ]
+  ]
+}
+```
+
 ## Install from GitHub
 
 From your OpenCode configuration directory:
@@ -47,7 +69,7 @@ Register the installed package directory in `~/.config/opencode/tui.json`:
 }
 ```
 
-The directory entry is required for GitHub-only installation. A bare `opencode-cpa-quota-plugin` spec asks OpenCode to download the package from the npm registry instead.
+The directory entry is required for GitHub-only installation. A bare package spec asks OpenCode to download it from the npm registry instead.
 
 Then export the key before starting OpenCode:
 
@@ -85,3 +107,7 @@ npm run check
 ```
 
 The package exposes its TUI entry through `exports["./tui"]`.
+
+## Publishing
+
+The repository includes `.github/workflows/publish.yml` for npm trusted publishing with GitHub Actions OIDC and provenance. Configure `caoool/opencode-cpa-quota-plugin` and that workflow as a trusted publisher in the npm package settings, then publish a GitHub release.
