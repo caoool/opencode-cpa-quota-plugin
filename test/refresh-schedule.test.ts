@@ -6,6 +6,7 @@ import {
   nextRefreshDelay,
   shouldAdoptCache,
   shouldPollAutomatically,
+  snapshotSlotState,
   TIMER_SLACK_MS,
 } from "../refresh-schedule"
 
@@ -19,6 +20,28 @@ test("polls interactive processes and only opt-in auto workers", () => {
   assert.equal(shouldPollAutomatically(false, true), true)
   assert.equal(shouldPollAutomatically(true, false), false)
   assert.equal(shouldPollAutomatically(true, true), true)
+})
+
+test("reads quota state at the slot root so mounted UI invalidates", () => {
+  let stateReads = 0
+  let refreshingReads = 0
+  const state = { checkedAt: 123 }
+
+  const snapshot = snapshotSlotState(
+    () => {
+      stateReads += 1
+      return state
+    },
+    () => {
+      refreshingReads += 1
+      return true
+    },
+  )
+
+  assert.equal(snapshot.state, state)
+  assert.equal(snapshot.refreshing, true)
+  assert.equal(stateReads, 1)
+  assert.equal(refreshingReads, 1)
 })
 
 test("schedules from the completed refresh instead of plugin startup", () => {

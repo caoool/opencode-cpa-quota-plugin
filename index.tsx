@@ -9,6 +9,7 @@ import {
   nextRefreshDelay,
   shouldAdoptCache,
   shouldPollAutomatically,
+  snapshotSlotState,
   TIMER_SLACK_MS,
 } from "./refresh-schedule"
 
@@ -534,17 +535,17 @@ async function fetchReports(baseURL: string, key: string, timeoutMs: number): Pr
 
 function QuotaView(props: {
   api: TuiPluginApi
-  state: () => QuotaState
-  refreshing: () => boolean
+  state: QuotaState
+  refreshing: boolean
   refresh: (notify?: boolean) => Promise<void>
 }) {
   const reports = createMemo(() =>
-    [...props.state().reports].sort(
+    [...props.state.reports].sort(
       (left, right) => PROVIDER_ORDER[left.kind] - PROVIDER_ORDER[right.kind] || left.account.localeCompare(right.account),
     ),
   )
   const checked = createMemo(() => {
-    const value = props.state().checkedAt ?? props.state().updatedAt
+    const value = props.state.checkedAt ?? props.state.updatedAt
     if (!value) return undefined
     return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
   })
@@ -556,7 +557,7 @@ function QuotaView(props: {
           <b>Quota</b>
         </text>
         <box flexDirection="row" alignItems="center" gap={1}>
-          <text fg={props.api.theme.current.textMuted}>{props.refreshing() ? "refreshing" : checked()}</text>
+          <text fg={props.api.theme.current.textMuted}>{props.refreshing ? "refreshing" : checked()}</text>
           <box
             height={1}
             paddingX={1}
@@ -568,26 +569,26 @@ function QuotaView(props: {
         </box>
       </box>
 
-      <Show when={props.state().status === "missing-key"}>
+      <Show when={props.state.status === "missing-key"}>
         <text fg={props.api.theme.current.warning}>Set managementKey in tui.json</text>
         <text fg={props.api.theme.current.textMuted}>then restart OpenCode</text>
       </Show>
 
-      <Show when={props.state().status === "missing-base-url"}>
+      <Show when={props.state.status === "missing-base-url"}>
         <text fg={props.api.theme.current.warning}>Set baseURL in tui.json</text>
         <text fg={props.api.theme.current.textMuted}>then restart OpenCode</text>
       </Show>
 
-      <Show when={props.state().status === "loading" && !props.state().reports.length}>
+      <Show when={props.state.status === "loading" && !props.state.reports.length}>
         <text fg={props.api.theme.current.textMuted}>Loading subscription usage…</text>
       </Show>
 
-      <Show when={props.state().status === "error" && !props.state().reports.length}>
-        <text fg={props.api.theme.current.error}>{props.state().error ?? "Quota unavailable"}</text>
+      <Show when={props.state.status === "error" && !props.state.reports.length}>
+        <text fg={props.api.theme.current.error}>{props.state.error ?? "Quota unavailable"}</text>
       </Show>
 
-      <Show when={props.state().error && props.state().reports.length}>
-        <text fg={props.api.theme.current.warning}>{props.state().error}</text>
+      <Show when={props.state.error && props.state.reports.length}>
+        <text fg={props.api.theme.current.warning}>{props.state.error}</text>
       </Show>
 
       <box width="100%" gap={1}>
@@ -628,7 +629,7 @@ function QuotaView(props: {
         </For>
       </box>
 
-      <Show when={props.state().status === "ready" && !reports().length}>
+      <Show when={props.state.status === "ready" && !reports().length}>
         <text fg={props.api.theme.current.textMuted}>No supported quota accounts</text>
       </Show>
     </box>
@@ -861,11 +862,14 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     order: 110,
     slots: {
       sidebar_content(_ctx, props) {
+        // OpenCode's slot registry tracks signals read by the slot renderer.
+        // Snapshot them here so timer-driven updates invalidate this mounted slot.
+        const snapshot = snapshotSlotState(state, refreshing)
         return (
           <QuotaView
             api={api}
-            state={state}
-            refreshing={refreshing}
+            state={snapshot.state}
+            refreshing={snapshot.refreshing}
             refresh={refresh}
           />
         )

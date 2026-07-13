@@ -10,6 +10,12 @@ function clampRefreshMs(value) {
 function shouldPollAutomatically(autoMode, pollInAutoMode) {
   return !autoMode || pollInAutoMode;
 }
+function snapshotSlotState(state, refreshing) {
+  return {
+    state: state(),
+    refreshing: refreshing()
+  };
+}
 function nextRefreshDelay(checkedAt, refreshMs, now) {
   return Math.min(
     refreshMs + TIMER_SLACK_MS,
@@ -439,12 +445,12 @@ async function fetchReports(baseURL, key, timeoutMs) {
 }
 function QuotaView(props) {
   const reports = createMemo(
-    () => [...props.state().reports].sort(
+    () => [...props.state.reports].sort(
       (left, right) => PROVIDER_ORDER[left.kind] - PROVIDER_ORDER[right.kind] || left.account.localeCompare(right.account)
     )
   );
   const checked = createMemo(() => {
-    const value = props.state().checkedAt ?? props.state().updatedAt;
+    const value = props.state.checkedAt ?? props.state.updatedAt;
     if (!value) return void 0;
     return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   });
@@ -452,7 +458,7 @@ function QuotaView(props) {
     /* @__PURE__ */ jsxs("box", { width: "100%", flexDirection: "row", justifyContent: "space-between", marginBottom: 1, children: [
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.text, children: /* @__PURE__ */ jsx("b", { children: "Quota" }) }),
       /* @__PURE__ */ jsxs("box", { flexDirection: "row", alignItems: "center", gap: 1, children: [
-        /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: props.refreshing() ? "refreshing" : checked() }),
+        /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: props.refreshing ? "refreshing" : checked() }),
         /* @__PURE__ */ jsx(
           "box",
           {
@@ -465,17 +471,17 @@ function QuotaView(props) {
         )
       ] })
     ] }),
-    /* @__PURE__ */ jsxs(Show, { when: props.state().status === "missing-key", children: [
+    /* @__PURE__ */ jsxs(Show, { when: props.state.status === "missing-key", children: [
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: "Set managementKey in tui.json" }),
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "then restart OpenCode" })
     ] }),
-    /* @__PURE__ */ jsxs(Show, { when: props.state().status === "missing-base-url", children: [
+    /* @__PURE__ */ jsxs(Show, { when: props.state.status === "missing-base-url", children: [
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: "Set baseURL in tui.json" }),
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "then restart OpenCode" })
     ] }),
-    /* @__PURE__ */ jsx(Show, { when: props.state().status === "loading" && !props.state().reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "Loading subscription usage\u2026" }) }),
-    /* @__PURE__ */ jsx(Show, { when: props.state().status === "error" && !props.state().reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.error, children: props.state().error ?? "Quota unavailable" }) }),
-    /* @__PURE__ */ jsx(Show, { when: props.state().error && props.state().reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: props.state().error }) }),
+    /* @__PURE__ */ jsx(Show, { when: props.state.status === "loading" && !props.state.reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "Loading subscription usage\u2026" }) }),
+    /* @__PURE__ */ jsx(Show, { when: props.state.status === "error" && !props.state.reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.error, children: props.state.error ?? "Quota unavailable" }) }),
+    /* @__PURE__ */ jsx(Show, { when: props.state.error && props.state.reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: props.state.error }) }),
     /* @__PURE__ */ jsx("box", { width: "100%", gap: 1, children: /* @__PURE__ */ jsx(For, { each: reports(), children: (report) => /* @__PURE__ */ jsxs("box", { width: "100%", children: [
       /* @__PURE__ */ jsxs("box", { width: "100%", flexDirection: "row", justifyContent: "space-between", children: [
         /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.text, children: /* @__PURE__ */ jsx("b", { children: providerTitle(report.kind) }) }),
@@ -496,7 +502,7 @@ function QuotaView(props) {
         ] });
       } })
     ] }) }) }),
-    /* @__PURE__ */ jsx(Show, { when: props.state().status === "ready" && !reports().length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "No supported quota accounts" }) })
+    /* @__PURE__ */ jsx(Show, { when: props.state.status === "ready" && !reports().length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "No supported quota accounts" }) })
   ] });
 }
 var tui = async (api, rawOptions) => {
@@ -699,12 +705,13 @@ var tui = async (api, rawOptions) => {
     order: 110,
     slots: {
       sidebar_content(_ctx, props) {
+        const snapshot = snapshotSlotState(state, refreshing);
         return /* @__PURE__ */ jsx(
           QuotaView,
           {
             api,
-            state,
-            refreshing,
+            state: snapshot.state,
+            refreshing: snapshot.refreshing,
             refresh
           }
         );

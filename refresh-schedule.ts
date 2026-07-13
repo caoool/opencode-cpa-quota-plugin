@@ -9,6 +9,13 @@ export function shouldPollAutomatically(autoMode: boolean, pollInAutoMode: boole
   return !autoMode || pollInAutoMode
 }
 
+export function snapshotSlotState<State>(state: () => State, refreshing: () => boolean) {
+  return {
+    state: state(),
+    refreshing: refreshing(),
+  }
+}
+
 export function nextRefreshDelay(checkedAt: number, refreshMs: number, now: number) {
   return Math.min(
     refreshMs + TIMER_SLACK_MS,

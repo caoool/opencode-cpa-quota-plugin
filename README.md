@@ -11,8 +11,9 @@ An OpenCode TUI sidebar plugin that displays subscription quota usage for Codex,
 - Provides a clickable refresh control and `/quota` command.
 - Uses persistent OpenCode KV caching, request leasing, and exponential backoff to avoid quota-endpoint rate limits.
 - Schedules each automatic refresh from the most recent completed refresh, so `refreshMs` is not accidentally doubled.
-- Adopts newer shared-cache results written by another OpenCode process.
+- Restores the most recently persisted quota result when a process starts.
 - Shows the latest check time while retaining visible warnings when cached provider data is used.
+- Updates the already-mounted sidebar after timer-driven checks; reopening OpenCode is not required.
 - Suppresses background polling in `opencode --auto` workers by default, with an opt-in override.
 
 ## Requirements
@@ -87,10 +88,10 @@ The directory entry is required for GitHub-only installation. A bare package spe
 | `refreshMs` | `600000` | Automatic refresh interval. Values below one minute are clamped. |
 | `timeoutMs` | `20000` | Request timeout. |
 | `backoffMs` | `300000` | Initial rate-limit backoff, doubled up to one hour. |
-| `pollInAutoMode` | `false` | Allow `opencode --auto` workers to participate in automatic polling. Shared leases coalesce concurrent requests. |
+| `pollInAutoMode` | `false` | Allow `opencode --auto` workers to participate in automatic polling. Each OpenCode process maintains its own live cache. |
 | `planLabels` | `{}` | Fallback labels keyed by `codex`, `claude`, or `grok`. Fetched labels take priority. |
 
-Automatic polling is disabled in `opencode --auto` workers by default to prevent duplicate upstream requests. Set `pollInAutoMode` to `true` to enable it; cross-process leases coalesce workers so normally only one performs each upstream refresh. Values below one minute are clamped to one minute.
+Automatic polling is disabled in `opencode --auto` workers by default to prevent duplicate upstream requests. Set `pollInAutoMode` to `true` to enable it. Separate concurrently running OpenCode processes may each poll because OpenCode's TUI KV store is live only within its owning process. Values below one minute are clamped to one minute.
 
 ## Usage
 
