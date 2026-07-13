@@ -8,6 +8,7 @@ import {
   clampRefreshMs,
   nextRefreshDelay,
   shouldAdoptCache,
+  shouldPollAutomatically,
   TIMER_SLACK_MS,
 } from "./refresh-schedule"
 
@@ -58,6 +59,7 @@ type PluginOptions = {
   refreshMs?: number
   timeoutMs?: number
   managementKey?: string
+  pollInAutoMode?: boolean
   planLabels?: Partial<Record<ProviderKind, string>>
   backoffMs?: number
 }
@@ -642,6 +644,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const timeoutMs = Math.max(5_000, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS)
   const backoffMs = Math.max(60_000, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS)
   const leaseMs = timeoutMs * 2 + 10_000
+  const automaticPolling = shouldPollAutomatically(autoMode, options.pollInAutoMode === true)
   const key = string(options.managementKey)
   const planLabels = record(options.planLabels)
   const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -668,7 +671,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   let refresh: (notify?: boolean) => Promise<void>
 
   const scheduleRefresh = (delay: number) => {
-    if (autoMode || api.lifecycle.signal.aborted) return
+    if (!automaticPolling || api.lifecycle.signal.aborted) return
     if (scheduled) clearTimeout(scheduled)
     scheduled = setTimeout(() => {
       scheduled = undefined

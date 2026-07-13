@@ -5,6 +5,10 @@ export function clampRefreshMs(value: number) {
   return Math.max(MIN_REFRESH_MS, value)
 }
 
+export function shouldPollAutomatically(autoMode: boolean, pollInAutoMode: boolean) {
+  return !autoMode || pollInAutoMode
+}
+
 export function nextRefreshDelay(checkedAt: number, refreshMs: number, now: number) {
   return Math.min(
     refreshMs + TIMER_SLACK_MS,

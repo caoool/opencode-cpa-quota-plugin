@@ -7,6 +7,9 @@ var MIN_REFRESH_MS = 6e4;
 function clampRefreshMs(value) {
   return Math.max(MIN_REFRESH_MS, value);
 }
+function shouldPollAutomatically(autoMode, pollInAutoMode) {
+  return !autoMode || pollInAutoMode;
+}
 function nextRefreshDelay(checkedAt, refreshMs, now) {
   return Math.min(
     refreshMs + TIMER_SLACK_MS,
@@ -505,6 +508,7 @@ var tui = async (api, rawOptions) => {
   const timeoutMs = Math.max(5e3, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS);
   const backoffMs = Math.max(6e4, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS);
   const leaseMs = timeoutMs * 2 + 1e4;
+  const automaticPolling = shouldPollAutomatically(autoMode, options.pollInAutoMode === true);
   const key = string(options.managementKey);
   const planLabels = record(options.planLabels);
   const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -524,7 +528,7 @@ var tui = async (api, rawOptions) => {
   let scheduled;
   let refresh;
   const scheduleRefresh = (delay) => {
-    if (autoMode || api.lifecycle.signal.aborted) return;
+    if (!automaticPolling || api.lifecycle.signal.aborted) return;
     if (scheduled) clearTimeout(scheduled);
     scheduled = setTimeout(() => {
       scheduled = void 0;

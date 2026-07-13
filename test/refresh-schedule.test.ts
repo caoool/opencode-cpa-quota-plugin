@@ -5,12 +5,20 @@ import {
   MIN_REFRESH_MS,
   nextRefreshDelay,
   shouldAdoptCache,
+  shouldPollAutomatically,
   TIMER_SLACK_MS,
 } from "../refresh-schedule"
 
 test("honors a one-minute refresh interval and clamps only lower values", () => {
   assert.equal(clampRefreshMs(60_000), 60_000)
   assert.equal(clampRefreshMs(10_000), MIN_REFRESH_MS)
+})
+
+test("polls interactive processes and only opt-in auto workers", () => {
+  assert.equal(shouldPollAutomatically(false, false), true)
+  assert.equal(shouldPollAutomatically(false, true), true)
+  assert.equal(shouldPollAutomatically(true, false), false)
+  assert.equal(shouldPollAutomatically(true, true), true)
 })
 
 test("schedules from the completed refresh instead of plugin startup", () => {

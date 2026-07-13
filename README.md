@@ -13,7 +13,7 @@ An OpenCode TUI sidebar plugin that displays subscription quota usage for Codex,
 - Schedules each automatic refresh from the most recent completed refresh, so `refreshMs` is not accidentally doubled.
 - Adopts newer shared-cache results written by another OpenCode process.
 - Shows the latest check time while retaining visible warnings when cached provider data is used.
-- Suppresses background polling in `opencode --auto` workers while keeping cached UI available.
+- Suppresses background polling in `opencode --auto` workers by default, with an opt-in override.
 
 ## Requirements
 
@@ -87,9 +87,10 @@ The directory entry is required for GitHub-only installation. A bare package spe
 | `refreshMs` | `600000` | Automatic refresh interval. Values below one minute are clamped. |
 | `timeoutMs` | `20000` | Request timeout. |
 | `backoffMs` | `300000` | Initial rate-limit backoff, doubled up to one hour. |
+| `pollInAutoMode` | `false` | Allow `opencode --auto` workers to participate in automatic polling. Shared leases coalesce concurrent requests. |
 | `planLabels` | `{}` | Fallback labels keyed by `codex`, `claude`, or `grok`. Fetched labels take priority. |
 
-Automatic polling is disabled in `opencode --auto` workers to prevent duplicate upstream requests. Interactive OpenCode processes refresh after `refreshMs`; values below one minute are clamped to one minute.
+Automatic polling is disabled in `opencode --auto` workers by default to prevent duplicate upstream requests. Set `pollInAutoMode` to `true` to enable it; cross-process leases coalesce workers so normally only one performs each upstream refresh. Values below one minute are clamped to one minute.
 
 ## Usage
 
