@@ -7,28 +7,24 @@ import { createMemo, createSignal, For, Show } from "solid-js"
 import {
   clampRefreshMs,
   nextRefreshDelay,
+  selectMissingCacheFallback,
+  sharedCacheDisplayStatus,
   shouldAdoptCache,
   shouldPollAutomatically,
   snapshotSlotState,
   TIMER_SLACK_MS,
 } from "./refresh-schedule"
-
-type ProviderKind = "codex" | "claude" | "grok"
-
-type QuotaWindow = {
-  id: string
-  label: string
-  used: number
-  reset?: string
-}
-
-type QuotaReport = {
-  kind: ProviderKind
-  account: string
-  plan?: string
-  windows: QuotaWindow[]
-  error?: string
-}
+import {
+  createSharedQuotaStore,
+  InvalidSharedQuotaCacheError,
+  LeaseLostError,
+  quotaCache,
+  type ProviderKind,
+  type QuotaCache,
+  type QuotaReport,
+  type QuotaWindow,
+  type SharedQuotaLease,
+} from "./shared-quota-store"
 
 type QuotaState = {
   status: "loading" | "ready" | "missing-base-url" | "missing-key" | "error"
@@ -36,16 +32,6 @@ type QuotaState = {
   updatedAt?: number
   checkedAt?: number
   error?: string
-}
-
-type QuotaCache = {
-  reports: QuotaReport[]
-  updatedAt?: number
-  checkedAt?: number
-  retryAt?: number
-  failures: number
-  leaseOwner?: string
-  leaseUntil?: number
 }
 
 type AuthFile = Record<string, unknown> & {
@@ -69,7 +55,10 @@ const DEFAULT_REFRESH_MS = 600_000
 const DEFAULT_TIMEOUT_MS = 20_000
 const DEFAULT_BACKOFF_MS = 300_000
 const MAX_BACKOFF_MS = 3_600_000
-const CACHE_KEY = "cpa-quota-sidebar.cache.v2"
+const LEGACY_CACHE_KEY = "cpa-quota-sidebar.cache.v2"
+const SHARED_SYNC_MS = 5_000
+const STORAGE_RETRY_MS = 5_000
+const LOCK_RETRY_MS = 1_000
 const PROVIDER_ORDER: Record<ProviderKind, number> = { codex: 0, claude: 1, grok: 2 }
 const PLAN_KEYS = new Set([
   "plan",
@@ -103,19 +92,6 @@ function number(value: unknown): number | undefined {
 
 function string(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined
-}
-
-function quotaCache(value: unknown): QuotaCache {
-  const source = record(value)
-  return {
-    reports: Array.isArray(source.reports) ? (source.reports as QuotaReport[]) : [],
-    updatedAt: number(source.updatedAt),
-    checkedAt: number(source.checkedAt),
-    retryAt: number(source.retryAt),
-    failures: number(source.failures) ?? 0,
-    leaseOwner: string(source.leaseOwner),
-    leaseUntil: number(source.leaseUntil),
-  }
 }
 
 function rateLimited(value: string | undefined) {
@@ -587,6 +563,10 @@ function QuotaView(props: {
         <text fg={props.api.theme.current.error}>{props.state.error ?? "Quota unavailable"}</text>
       </Show>
 
+      <Show when={props.state.error && !props.state.reports.length && props.state.status !== "error"}>
+        <text fg={props.api.theme.current.error}>{props.state.error}</text>
+      </Show>
+
       <Show when={props.state.error && props.state.reports.length}>
         <text fg={props.api.theme.current.warning}>{props.state.error}</text>
       </Show>
@@ -644,35 +624,69 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const refreshMs = clampRefreshMs(number(options.refreshMs) ?? DEFAULT_REFRESH_MS)
   const timeoutMs = Math.max(5_000, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS)
   const backoffMs = Math.max(60_000, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS)
-  const leaseMs = timeoutMs * 2 + 10_000
+  const leaseMs = timeoutMs * 2 + 15_000
   const automaticPolling = shouldPollAutomatically(autoMode, options.pollInAutoMode === true)
   const key = string(options.managementKey)
   const planLabels = record(options.planLabels)
-  const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
-  const readCache = () => quotaCache(api.kv.get(CACHE_KEY, {}))
-  const writeCache = (value: QuotaCache) => api.kv.set(CACHE_KEY, value)
-  const initialCache = readCache()
+  const store = createSharedQuotaStore({ stateDir: api.state.path.state })
+  const legacyValue = api.kv.get(LEGACY_CACHE_KEY, {})
+  const legacyCache = quotaCache(legacyValue)
+  let initialCache = quotaCache({})
+  let initialStorageError: string | undefined
+  let migrationPending = true
+  try {
+    const initial = await store.initializeFromLegacy(legacyValue, leaseMs)
+    initialCache = initial.cache ?? initialCache
+    migrationPending = initial.busy && !initial.cache
+  } catch (error) {
+    initialStorageError = error instanceof Error ? error.message : "Shared quota cache initialization failed"
+    migrationPending = !(error instanceof InvalidSharedQuotaCacheError)
+  }
+
+  const configuredStatus = () => (!baseURL ? "missing-base-url" : !key ? "missing-key" : "ready") as QuotaState["status"]
+  const cacheVersion = (cache: Pick<QuotaCache, "checkedAt" | "updatedAt">) => cache.checkedAt ?? cache.updatedAt
+  const stateFromCache = (
+    cache: QuotaCache,
+    options: { error?: string; loadingWhenEmpty?: boolean } = {},
+  ): QuotaState => {
+    const error = options.error ?? cache.error
+    const configured = configuredStatus()
+    const loading =
+      configured === "ready" &&
+      options.loadingWhenEmpty === true &&
+      !error &&
+      cache.reports.length === 0 &&
+      cacheVersion(cache) === undefined
+    const status = loading
+      ? "loading"
+      : sharedCacheDisplayStatus({
+          configuredStatus: configured,
+          readyStatus: "ready" as QuotaState["status"],
+          errorStatus: "error" as QuotaState["status"],
+          reportCount: cache.reports.length,
+          error,
+        })
+    return {
+      status,
+      reports: cache.reports,
+      updatedAt: cache.updatedAt,
+      checkedAt: cache.checkedAt,
+      error,
+    }
+  }
+  let latestCache = initialCache
   const [state, setState] = createSignal<QuotaState>(
-    !baseURL
-      ? { status: "missing-base-url", reports: [] }
-      : !key
-      ? { status: "missing-key", reports: [] }
-      : initialCache.reports.length
-        ? {
-            status: "ready",
-            reports: initialCache.reports,
-            updatedAt: initialCache.updatedAt,
-            checkedAt: initialCache.checkedAt,
-          }
-        : { status: "loading", reports: [] },
+    stateFromCache(initialCache, { error: initialStorageError, loadingWhenEmpty: true }),
   )
   const [refreshing, setRefreshing] = createSignal(false)
   let inflight: Promise<void> | undefined
   let scheduled: ReturnType<typeof setTimeout> | undefined
   let refresh: (notify?: boolean) => Promise<void>
+  let storageErrorActive = Boolean(initialStorageError)
+  let storageProbeRequired = Boolean(initialStorageError)
 
   const scheduleRefresh = (delay: number) => {
-    if (!automaticPolling || api.lifecycle.signal.aborted) return
+    if (api.lifecycle.signal.aborted) return
     if (scheduled) clearTimeout(scheduled)
     scheduled = setTimeout(() => {
       scheduled = undefined
@@ -682,21 +696,36 @@ const tui: TuiPlugin = async (api, rawOptions) => {
 
   const adoptCache = (cache: QuotaCache) => {
     const current = state()
+    const currentVersion = current.checkedAt ?? current.updatedAt
+    const sharedVersion = cacheVersion(cache)
+    let adopted: QuotaCache | undefined
     if (
       shouldAdoptCache({
         currentHasReports: current.reports.length > 0,
-        currentVersion: current.checkedAt ?? current.updatedAt,
+        currentVersion,
         cacheHasReports: cache.reports.length > 0,
-        cacheVersion: cache.checkedAt ?? cache.updatedAt,
+        cacheVersion: sharedVersion,
       })
     ) {
-      setState({
-        status: "ready",
-        reports: cache.reports,
-        updatedAt: cache.updatedAt,
-        checkedAt: cache.checkedAt,
+      adopted = cache
+    } else if (
+      (sharedVersion !== undefined && sharedVersion > (currentVersion ?? Number.NEGATIVE_INFINITY)) ||
+      (currentVersion === undefined && Boolean(cache.error))
+    ) {
+      adopted = quotaCache({
+        reports: cache.reports.length ? cache.reports : current.reports,
+        updatedAt: cache.updatedAt ?? current.updatedAt,
+        checkedAt: cache.checkedAt ?? current.checkedAt,
+        retryAt: cache.retryAt,
+        failures: cache.failures,
+        error: cache.error,
       })
     }
+    if (adopted) {
+      latestCache = adopted
+      setState(stateFromCache(adopted, { error: storageErrorActive ? current.error : adopted.error }))
+    }
+    return latestCache
   }
 
   const retryLabel = (timestamp: number) =>
@@ -705,137 +734,315 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const backoffDelay = (failures: number) =>
     Math.min(MAX_BACKOFF_MS, backoffMs * 2 ** Math.min(8, Math.max(0, failures - 1)))
 
+  const scheduleFromCache = (cache: QuotaCache, now = Date.now()) => {
+    if (!automaticPolling) {
+      scheduleRefresh(SHARED_SYNC_MS)
+      return
+    }
+    if (cache.retryAt && cache.retryAt > now) {
+      scheduleRefresh(Math.min(SHARED_SYNC_MS, cache.retryAt - now + TIMER_SLACK_MS))
+      return
+    }
+    const checkedAt = cacheVersion(cache)
+    if (checkedAt && now - checkedAt < refreshMs) {
+      scheduleRefresh(Math.min(SHARED_SYNC_MS, nextRefreshDelay(checkedAt, refreshMs, now)))
+      return
+    }
+    scheduleRefresh(TIMER_SLACK_MS)
+  }
+
+  const markStorageError = (error: unknown, notify: boolean) => {
+    const message = error instanceof Error ? error.message : "Shared quota storage failed"
+    storageErrorActive = true
+    storageProbeRequired = true
+    setState((previous) => ({
+      ...previous,
+      status:
+        previous.status === "missing-base-url" || previous.status === "missing-key"
+          ? previous.status
+          : previous.reports.length
+            ? "ready"
+            : "error",
+      error: message,
+    }))
+    scheduleRefresh(STORAGE_RETRY_MS)
+    if (notify) api.ui.toast({ variant: "error", title: "CPA quota", message })
+  }
+
+  const clearStorageError = () => {
+    if (!storageErrorActive) return
+    storageErrorActive = false
+    setState(stateFromCache(latestCache, { loadingWhenEmpty: true }))
+  }
+
+  const showRetryToast = (retryAt: number) => {
+    api.ui.toast({
+      variant: "warning",
+      title: "CPA quota",
+      message: `Rate limited; retry after ${retryLabel(retryAt)}`,
+    })
+  }
+
+  const adoptAfterLeaseLoss = async (notify: boolean) => {
+    try {
+      const latest = await store.read()
+      if (latest) {
+        migrationPending = false
+        adoptCache(latest)
+      }
+    } catch (error) {
+      markStorageError(error, notify)
+      return
+    }
+    scheduleRefresh(LOCK_RETRY_MS)
+    if (notify) {
+      api.ui.toast({
+        variant: "warning",
+        title: "CPA quota",
+        message: "Another OpenCode process owns the quota refresh; waiting for its shared result",
+      })
+    }
+  }
+
   refresh = async (notify = false) => {
     if (inflight) return inflight
     inflight = (async () => {
-      if (!baseURL) {
-        setState({ status: "missing-base-url", reports: [] })
-        return
-      }
-      if (!key) {
-        setState({ status: "missing-key", reports: [] })
-        return
-      }
-
-      const now = Date.now()
-      let cache = readCache()
-      adoptCache(cache)
-
-      if (cache.retryAt && cache.retryAt > now) {
-        scheduleRefresh(cache.retryAt - now + 250)
-        if (notify) {
-          api.ui.toast({
-            variant: "warning",
-            title: "CPA quota",
-            message: `Rate limited; retry after ${retryLabel(cache.retryAt)}`,
-          })
-        }
-        return
-      }
-
-      const retryDue = cache.retryAt !== undefined && cache.retryAt <= now
-      const lastCheck = cache.checkedAt ?? cache.updatedAt
-      if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
-        scheduleRefresh(nextRefreshDelay(lastCheck, refreshMs, now))
-        return
-      }
-
-      if (cache.leaseOwner && cache.leaseOwner !== instanceID && cache.leaseUntil && cache.leaseUntil > now) {
-        scheduleRefresh(Math.min(5_000, Math.max(750, cache.leaseUntil - now + 250)))
-        return
-      }
-
-      writeCache({ ...cache, leaseOwner: instanceID, leaseUntil: now + leaseMs })
-      await new Promise((resolve) => setTimeout(resolve, 150 + Math.random() * 250))
-      cache = readCache()
-      if (cache.leaseOwner !== instanceID) {
-        scheduleRefresh(750 + Math.random() * 1_000)
-        return
-      }
-
-      setRefreshing(true)
+      let cache = latestCache
+      let sharedMissing = false
       try {
-        const fetched = (await fetchReports(baseURL, key, timeoutMs)).map((report) => ({
-          ...report,
-          plan: displayPlan(report.kind, report.plan, planLabels[report.kind]),
-        }))
-        if (api.lifecycle.signal.aborted) return
-        const activeCache = readCache()
-        if (activeCache.leaseOwner !== instanceID) {
-          adoptCache(activeCache)
-          scheduleRefresh(750 + Math.random() * 1_000)
-          return
-        }
-        cache = activeCache
-        const limited = fetched.filter((report) => rateLimited(report.error))
-        const failures = limited.length ? cache.failures + 1 : 0
-        const retryAt = limited.length ? Date.now() + backoffDelay(failures) : undefined
-        const displayFetched = fetched.map((report) =>
-          rateLimited(report.error) && retryAt
-            ? { ...report, error: `Rate limited · retry ${retryLabel(retryAt)}` }
-            : report,
-        )
-        const reports = mergeReports(displayFetched, cache.reports)
-        const complete = fetched.every((report) => !report.error)
-        const checkedAt = Date.now()
-        const updatedAt = complete ? checkedAt : (cache.updatedAt ?? checkedAt)
-        writeCache({ reports, updatedAt, checkedAt, retryAt, failures })
-        setState({ status: "ready", reports, updatedAt, checkedAt })
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS)
-        else scheduleRefresh(refreshMs + TIMER_SLACK_MS)
-        if (notify) {
-          const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)))
-          api.ui.toast({
-            variant: limited.length ? "warning" : "success",
-            title: "CPA quota",
-            message: limited.length
-              ? `${limited.map((report) => providerTitle(report.kind)).join(", ")} rate limited; ${cached ? "showing cached usage" : `retry after ${retryLabel(retryAt!)}`}`
-              : "Usage refreshed",
-          })
-        }
+        const shared = await store.read()
+        if (shared) {
+          migrationPending = false
+          cache = adoptCache(shared)
+        } else sharedMissing = true
       } catch (error) {
-        if (api.lifecycle.signal.aborted) return
-        const activeCache = readCache()
-        if (activeCache.leaseOwner !== instanceID) {
-          adoptCache(activeCache)
-          scheduleRefresh(750 + Math.random() * 1_000)
+        markStorageError(error, notify)
+        cache = latestCache
+      }
+
+      const allowUpstream = notify || automaticPolling
+      const needsCoordination = storageProbeRequired || migrationPending || sharedMissing
+      const beforeLockVersion = cacheVersion(cache)
+      const now = Date.now()
+
+      if (!needsCoordination) {
+        if (!baseURL || !key) {
+          setState((previous) => ({ ...previous, status: configuredStatus() }))
+          scheduleRefresh(SHARED_SYNC_MS)
           return
         }
-        cache = activeCache
-        const message = error instanceof Error ? error.message : "Quota refresh failed"
-        const limited = rateLimited(message)
-        const failures = limited ? cache.failures + 1 : cache.failures
-        const retryAt = limited ? Date.now() + backoffDelay(failures) : undefined
-        const checkedAt = Date.now()
-        writeCache({
-          reports: cache.reports,
-          updatedAt: cache.updatedAt,
-          checkedAt,
-          retryAt,
-          failures,
-        })
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS)
-        else scheduleRefresh(refreshMs + TIMER_SLACK_MS)
-        setState((previous) => ({
-          status: previous.reports.length ? "ready" : "error",
-          reports: previous.reports,
-          updatedAt: previous.updatedAt,
-          checkedAt,
-          error: message,
-        }))
-        if (notify) {
+        if (!allowUpstream) {
+          scheduleRefresh(SHARED_SYNC_MS)
+          return
+        }
+        if (cache.retryAt && cache.retryAt > now) {
+          scheduleFromCache(cache, now)
+          if (notify) showRetryToast(cache.retryAt)
+          return
+        }
+        const retryDue = cache.retryAt !== undefined && cache.retryAt <= now
+        const lastCheck = cacheVersion(cache)
+        if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
+          scheduleFromCache(cache, now)
+          return
+        }
+      }
+
+      let lease: SharedQuotaLease | undefined
+      let leaseLost = false
+      let didSetRefreshing = false
+      try {
+        try {
+          lease = await store.acquireLease(leaseMs)
+        } catch (error) {
+          markStorageError(error, notify)
+          return
+        }
+        if (!lease) {
+          scheduleRefresh(LOCK_RETRY_MS)
+          if (notify) {
+            api.ui.toast({
+              variant: "warning",
+              title: "CPA quota",
+              message: "Another OpenCode process is refreshing quota usage",
+            })
+          }
+          return
+        }
+
+        try {
+          let shared: QuotaCache | undefined
+          let readFailure: unknown
+          try {
+            shared = await store.read()
+          } catch (error) {
+            readFailure = error
+            markStorageError(error, notify && !storageErrorActive)
+          }
+
+          if (readFailure) {
+            if (!(readFailure instanceof InvalidSharedQuotaCacheError)) return
+            cache = latestCache
+            await store.write(cache, lease)
+            migrationPending = false
+            storageProbeRequired = false
+            clearStorageError()
+          } else if (shared) {
+            migrationPending = false
+            cache = adoptCache(shared)
+            if (storageProbeRequired) {
+              await store.write(cache, lease)
+              storageProbeRequired = false
+              clearStorageError()
+            }
+          } else {
+            cache = quotaCache(
+              selectMissingCacheFallback({
+                migrationPending,
+                legacy: legacyCache,
+                latest: latestCache,
+              }),
+            )
+            await store.write(cache, lease)
+            latestCache = cache
+            migrationPending = false
+            storageProbeRequired = false
+            clearStorageError()
+            setState(stateFromCache(cache, { loadingWhenEmpty: true }))
+          }
+        } catch (error) {
+          if (error instanceof LeaseLostError) {
+            leaseLost = true
+            await adoptAfterLeaseLoss(notify)
+          } else {
+            markStorageError(error, notify)
+          }
+          return
+        }
+
+        if (!baseURL || !key) {
+          setState((previous) => ({ ...previous, status: configuredStatus() }))
+          scheduleRefresh(SHARED_SYNC_MS)
+          return
+        }
+        if (!allowUpstream) {
+          scheduleRefresh(SHARED_SYNC_MS)
+          return
+        }
+
+        const lockedNow = Date.now()
+        if (cache.retryAt && cache.retryAt > lockedNow) {
+          scheduleFromCache(cache, lockedNow)
+          if (notify) showRetryToast(cache.retryAt)
+          return
+        }
+        const retryDue = cache.retryAt !== undefined && cache.retryAt <= lockedNow
+        const lockedVersion = cacheVersion(cache)
+        if (notify && lockedVersion !== undefined && lockedVersion > (beforeLockVersion ?? Number.NEGATIVE_INFINITY)) {
+          scheduleFromCache(cache, lockedNow)
           api.ui.toast({
-            variant: limited ? "warning" : "error",
+            variant: "success",
             title: "CPA quota",
-            message: limited && retryAt ? `Rate limited; retry after ${retryLabel(retryAt)}` : message,
+            message: "Usage was refreshed by another OpenCode process",
           })
+          return
         }
+        if (!notify && !retryDue && lockedVersion && lockedNow - lockedVersion < refreshMs) {
+          scheduleFromCache(cache, lockedNow)
+          return
+        }
+
+        setRefreshing(true)
+        didSetRefreshing = true
+        let nextCache: QuotaCache
+        let nextState: QuotaState
+        let toast:
+          | { variant: "warning" | "success" | "error"; message: string }
+          | undefined
+
+        try {
+          const fetched = (await fetchReports(baseURL, key, timeoutMs)).map((report) => ({
+            ...report,
+            plan: displayPlan(report.kind, report.plan, planLabels[report.kind]),
+          }))
+          if (api.lifecycle.signal.aborted) return
+          const limited = fetched.filter((report) => rateLimited(report.error))
+          const failures = limited.length ? cache.failures + 1 : 0
+          const retryAt = limited.length ? Date.now() + backoffDelay(failures) : undefined
+          const displayFetched = fetched.map((report) =>
+            rateLimited(report.error) && retryAt
+              ? { ...report, error: `Rate limited · retry ${retryLabel(retryAt)}` }
+              : report,
+          )
+          const reports = mergeReports(displayFetched, cache.reports)
+          const complete = fetched.every((report) => !report.error)
+          const checkedAt = Date.now()
+          const updatedAt = complete ? checkedAt : (cache.updatedAt ?? checkedAt)
+          nextCache = quotaCache({ reports, updatedAt, checkedAt, retryAt, failures })
+          nextState = stateFromCache(nextCache)
+          if (notify) {
+            const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)))
+            toast = {
+              variant: limited.length ? "warning" : "success",
+              message: limited.length
+                ? `${limited.map((report) => providerTitle(report.kind)).join(", ")} rate limited; ${cached ? "showing cached usage" : `retry after ${retryLabel(retryAt!)}`}`
+                : "Usage refreshed",
+            }
+          }
+        } catch (error) {
+          if (api.lifecycle.signal.aborted) return
+          const message = error instanceof Error ? error.message : "Quota refresh failed"
+          const limited = rateLimited(message)
+          const failures = limited ? cache.failures + 1 : cache.failures
+          const retryAt = limited ? Date.now() + backoffDelay(failures) : undefined
+          const checkedAt = Date.now()
+          nextCache = quotaCache({
+            reports: cache.reports,
+            updatedAt: cache.updatedAt,
+            checkedAt,
+            retryAt,
+            failures,
+            error: message,
+          })
+          nextState = stateFromCache(nextCache)
+          if (notify) {
+            toast = {
+              variant: limited ? "warning" : "error",
+              message: limited && retryAt ? `Rate limited; retry after ${retryLabel(retryAt)}` : message,
+            }
+          }
+        }
+
+        try {
+          await store.write(nextCache, lease)
+        } catch (error) {
+          if (error instanceof LeaseLostError) {
+            leaseLost = true
+            await adoptAfterLeaseLoss(notify)
+          } else {
+            markStorageError(error, notify)
+          }
+          return
+        }
+        cache = nextCache
+        latestCache = nextCache
+        storageProbeRequired = false
+        clearStorageError()
+        setState(nextState)
+        scheduleFromCache(nextCache)
+        if (toast) api.ui.toast({ ...toast, title: "CPA quota" })
       } finally {
-        const latest = readCache()
-        if (latest.leaseOwner === instanceID) {
-          writeCache({ ...latest, leaseOwner: undefined, leaseUntil: undefined })
+        if (didSetRefreshing) setRefreshing(false)
+        if (lease && !leaseLost) {
+          try {
+            const released = await lease.release()
+            if (!released && !api.lifecycle.signal.aborted) {
+              markStorageError(new Error("Shared quota refresh lease was lost before release"), notify)
+            }
+          } catch (error) {
+            markStorageError(error, notify)
+          }
         }
-        setRefreshing(false)
       }
     })()
     try {
@@ -848,7 +1055,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           status: previous.reports.length ? "ready" : "error",
           error: message,
         }))
-        scheduleRefresh(refreshMs + TIMER_SLACK_MS)
+        scheduleRefresh(STORAGE_RETRY_MS)
         if (notify) {
           api.ui.toast({ variant: "error", title: "CPA quota", message })
         }

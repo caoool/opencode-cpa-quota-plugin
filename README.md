@@ -9,12 +9,12 @@ An OpenCode TUI sidebar plugin that displays subscription quota usage for Codex,
 - Uses green, yellow, and red percentage thresholds.
 - Supports plan labels returned by upstream APIs and optional configured fallbacks.
 - Provides a clickable refresh control and `/quota` command.
-- Uses persistent OpenCode KV caching, request leasing, and exponential backoff to avoid quota-endpoint rate limits.
+- Uses a dedicated file-backed cache, cross-process request lease, and shared exponential backoff to avoid duplicate quota requests and rate limits.
 - Schedules each automatic refresh from the most recent completed refresh, so `refreshMs` is not accidentally doubled.
-- Restores the most recently persisted quota result when a process starts.
+- Restores the most recently persisted shared quota result when a process starts.
 - Shows the latest check time while retaining visible warnings when cached provider data is used.
 - Updates the already-mounted sidebar after timer-driven checks; reopening OpenCode is not required.
-- Suppresses background polling in `opencode --auto` workers by default, with an opt-in override.
+- Suppresses upstream polling in `opencode --auto` workers by default while still letting those processes follow shared cache updates.
 
 ## Requirements
 
@@ -88,16 +88,31 @@ The directory entry is required for GitHub-only installation. A bare package spe
 | `refreshMs` | `600000` | Automatic refresh interval. Values below one minute are clamped. |
 | `timeoutMs` | `20000` | Request timeout. |
 | `backoffMs` | `300000` | Initial rate-limit backoff, doubled up to one hour. |
-| `pollInAutoMode` | `false` | Allow `opencode --auto` workers to participate in automatic polling. Each OpenCode process maintains its own live cache. |
+| `pollInAutoMode` | `false` | Allow `opencode --auto` workers to participate in upstream polling. Disabled workers still read the shared cache. |
 | `planLabels` | `{}` | Fallback labels keyed by `codex`, `claude`, or `grok`. Fetched labels take priority. |
 
-Automatic polling is disabled in `opencode --auto` workers by default to prevent duplicate upstream requests. Set `pollInAutoMode` to `true` to enable it. Separate concurrently running OpenCode processes may each poll because OpenCode's TUI KV store is live only within its owning process. Values below one minute are clamped to one minute.
+Automatic upstream polling is disabled in `opencode --auto` workers by default. Set `pollInAutoMode` to `true` to let those workers contend for the same cross-process lease as interactive processes. Processes with polling disabled still read the shared file periodically, so an already-mounted sidebar adopts results written elsewhere. Values below one minute are clamped to one minute.
+
+## Shared cache, lease, and privacy
+
+Version 0.2.4 stores shared state beneath OpenCode's `api.state.path.state` directory:
+
+```text
+<stateDir>/cpa-quota-sidebar/cache.v1.json
+<stateDir>/cpa-quota-sidebar/refresh.v1.lock/
+```
+
+The cache is written through a synced `0600` temp file and atomic rename. Refresh ownership uses an atomic `0700` lock directory with a `0600` owner marker; stale or incomplete locks are recovered without recursive deletion. A corrupt, oversized, or wrong-schema cache is replaced with the latest normalized safe state only after a process acquires that lease and before it makes any upstream request. File modes are applied where the operating system supports them.
+
+The cache contains only normalized sidebar reports (including the displayed account labels), update/check timestamps, retry timing, the shared failure count, and an optional bounded error message from the latest total refresh failure. It does not store `baseURL`, `managementKey`, provider tokens, auth indexes, or credential payloads. The first 0.2.4 process migrates display cache fields from the legacy `cpa-quota-sidebar.cache.v2` OpenCode KV entry when no dedicated cache file exists. Legacy lease fields are ignored, and the old KV entry is neither rewritten nor deleted. If the dedicated file later disappears, the process rewrites its latest normalized shared/display state rather than replaying the process-start legacy snapshot.
+
+**Upgrade requirement:** quit and restart every OpenCode process after installing 0.2.4. A still-running 0.2.3 process does not understand the shared file lease and can continue issuing duplicate requests until it exits.
 
 ## Usage
 
 - Click the refresh icon in the **Quota** title row.
 - Run `/quota` or `/quota-refresh`.
-- Successful results are cached across OpenCode restarts.
+- Successful results are shared across concurrent OpenCode processes and cached across restarts.
 
 ## Development
 

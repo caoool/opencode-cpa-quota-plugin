@@ -4,6 +4,8 @@ import {
   clampRefreshMs,
   MIN_REFRESH_MS,
   nextRefreshDelay,
+  selectMissingCacheFallback,
+  sharedCacheDisplayStatus,
   shouldAdoptCache,
   shouldPollAutomatically,
   snapshotSlotState,
@@ -20,6 +22,43 @@ test("polls interactive processes and only opt-in auto workers", () => {
   assert.equal(shouldPollAutomatically(false, true), true)
   assert.equal(shouldPollAutomatically(true, false), false)
   assert.equal(shouldPollAutomatically(true, true), true)
+})
+
+test("renders shared total failures as errors without reports and warnings with stale reports", () => {
+  assert.equal(
+    sharedCacheDisplayStatus({
+      configuredStatus: "ready",
+      readyStatus: "ready",
+      errorStatus: "error",
+      reportCount: 0,
+      error: "management endpoint unavailable",
+    }),
+    "error",
+  )
+  assert.equal(
+    sharedCacheDisplayStatus({
+      configuredStatus: "ready",
+      readyStatus: "ready",
+      errorStatus: "error",
+      reportCount: 1,
+      error: "management endpoint unavailable",
+    }),
+    "ready",
+  )
+})
+
+test("uses legacy only for pending initial migration, then preserves the latest cache", () => {
+  const legacy = { checkedAt: 1, source: "legacy" }
+  const latest = { checkedAt: 2, source: "shared" }
+
+  assert.equal(
+    selectMissingCacheFallback({ migrationPending: true, legacy, latest }),
+    legacy,
+  )
+  assert.equal(
+    selectMissingCacheFallback({ migrationPending: false, legacy, latest }),
+    latest,
+  )
 })
 
 test("reads quota state at the slot root so mounted UI invalidates", () => {

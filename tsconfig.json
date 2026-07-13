@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["index.tsx", "refresh-schedule.ts", "test/**/*.ts"]
+  "include": ["index.tsx", "refresh-schedule.ts", "shared-quota-store.ts", "test/**/*.ts"]
 }

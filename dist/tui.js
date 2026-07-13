@@ -10,6 +10,13 @@ function clampRefreshMs(value) {
 function shouldPollAutomatically(autoMode, pollInAutoMode) {
   return !autoMode || pollInAutoMode;
 }
+function sharedCacheDisplayStatus(input) {
+  if (input.configuredStatus !== input.readyStatus) return input.configuredStatus;
+  return input.error && input.reportCount === 0 ? input.errorStatus : input.readyStatus;
+}
+function selectMissingCacheFallback(input) {
+  return input.migrationPending ? input.legacy : input.latest;
+}
 function snapshotSlotState(state, refreshing) {
   return {
     state: state(),
@@ -28,13 +35,550 @@ function shouldAdoptCache(input) {
   return (input.cacheVersion ?? Number.NEGATIVE_INFINITY) > (input.currentVersion ?? Number.NEGATIVE_INFINITY);
 }
 
+// shared-quota-store.ts
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, open, readFile, readdir, rename, rmdir, unlink, utimes } from "node:fs/promises";
+import { join } from "node:path";
+var CACHE_SCHEMA_VERSION = 1;
+var CACHE_DIRECTORY = "cpa-quota-sidebar";
+var CACHE_FILE = "cache.v1.json";
+var LOCK_DIRECTORY = "refresh.v1.lock";
+var DEFAULT_INCOMPLETE_GRACE_MS = 2e3;
+var MAX_CACHE_BYTES = 1e6;
+var MAX_MARKER_BYTES = 4096;
+var SAFE_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
+var MAX_CACHE_ERROR_LENGTH = 500;
+function record(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function number(value) {
+  const result = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(result) ? result : void 0;
+}
+function string(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function cacheError(value) {
+  const result = string(value);
+  if (!result) return void 0;
+  const normalized = result.replace(/[\s\u0000-\u001f\u007f]+/g, " ").trim();
+  return normalized.slice(0, MAX_CACHE_ERROR_LENGTH).trimEnd() || void 0;
+}
+function providerKind(value) {
+  return value === "codex" || value === "claude" || value === "grok" ? value : void 0;
+}
+function quotaWindow(value) {
+  const source = record(value);
+  const id = string(source.id);
+  const label = string(source.label);
+  const used = number(source.used);
+  if (!id || !label || used === void 0) return void 0;
+  const reset = string(source.reset);
+  return {
+    id,
+    label,
+    used: Math.min(100, Math.max(0, used)),
+    ...reset ? { reset } : {}
+  };
+}
+function quotaReport(value) {
+  const source = record(value);
+  const kind = providerKind(source.kind);
+  const account = string(source.account);
+  if (!kind || !account) return void 0;
+  const plan = string(source.plan);
+  const error = string(source.error);
+  const windows = Array.isArray(source.windows) ? source.windows.map(quotaWindow).filter((item) => Boolean(item)) : [];
+  return {
+    kind,
+    account,
+    ...plan ? { plan } : {},
+    windows,
+    ...error ? { error } : {}
+  };
+}
+function quotaCache(value) {
+  const source = record(value);
+  const reports = Array.isArray(source.reports) ? source.reports.map(quotaReport).filter((item) => Boolean(item)) : [];
+  const updatedAt = number(source.updatedAt);
+  const checkedAt = number(source.checkedAt);
+  const retryAt = number(source.retryAt);
+  const failures = Math.max(0, Math.floor(number(source.failures) ?? 0));
+  const error = cacheError(source.error);
+  return {
+    reports,
+    ...updatedAt === void 0 ? {} : { updatedAt },
+    ...checkedAt === void 0 ? {} : { checkedAt },
+    ...retryAt === void 0 ? {} : { retryAt },
+    failures,
+    ...error ? { error } : {}
+  };
+}
+function diskCache(value) {
+  const cache = quotaCache(value);
+  return {
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    reports: cache.reports,
+    ...cache.updatedAt === void 0 ? {} : { updatedAt: cache.updatedAt },
+    ...cache.checkedAt === void 0 ? {} : { checkedAt: cache.checkedAt },
+    ...cache.retryAt === void 0 ? {} : { retryAt: cache.retryAt },
+    failures: cache.failures,
+    ...cache.error ? { error: cache.error } : {}
+  };
+}
+function errorCode(error) {
+  return record(error).code;
+}
+function hasCode(error, ...codes) {
+  const code = errorCode(error);
+  return typeof code === "string" && codes.includes(code);
+}
+function message(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function sameStat(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+async function writeExclusiveSynced(path, value) {
+  const handle = await open(path, "wx", 384);
+  try {
+    await handle.writeFile(value, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+async function safeUnlink(path) {
+  try {
+    await unlink(path);
+    return true;
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return false;
+    throw error;
+  }
+}
+async function safeRmdir(path) {
+  try {
+    await rmdir(path);
+    return true;
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return true;
+    if (hasCode(error, "ENOTEMPTY", "EEXIST")) return false;
+    throw error;
+  }
+}
+var SharedQuotaStoreError = class extends Error {
+  constructor(message2, options) {
+    super(message2, options);
+    this.name = "SharedQuotaStoreError";
+  }
+};
+var InvalidSharedQuotaCacheError = class extends SharedQuotaStoreError {
+  constructor(message2, options) {
+    super(message2, options);
+    this.name = "InvalidSharedQuotaCacheError";
+  }
+};
+var LeaseLostError = class extends SharedQuotaStoreError {
+  constructor(message2 = "Shared quota refresh lease was lost") {
+    super(message2);
+    this.name = "LeaseLostError";
+  }
+};
+var FileQuotaLease = class {
+  constructor(store, owner) {
+    this.store = store;
+    this.owner = owner;
+  }
+  #released = false;
+  async renew() {
+    if (this.#released) return false;
+    const renewed = await this.store.renewLease(this.owner);
+    if (!renewed) this.#released = true;
+    return renewed;
+  }
+  async release() {
+    if (this.#released) return false;
+    const released = await this.store.releaseLease(this.owner);
+    this.#released = true;
+    return released;
+  }
+};
+var SharedQuotaStore = class {
+  paths;
+  now;
+  token;
+  incompleteGraceMs;
+  leases = /* @__PURE__ */ new WeakSet();
+  tempSequence = 0;
+  constructor(options) {
+    if (!string(options.stateDir)) throw new SharedQuotaStoreError("OpenCode state directory is unavailable");
+    this.paths = {
+      directory: join(options.stateDir, CACHE_DIRECTORY),
+      cache: join(options.stateDir, CACHE_DIRECTORY, CACHE_FILE),
+      lock: join(options.stateDir, CACHE_DIRECTORY, LOCK_DIRECTORY)
+    };
+    this.now = options.now ?? Date.now;
+    this.token = options.token ?? randomUUID;
+    this.incompleteGraceMs = Math.max(1, Math.floor(options.incompleteGraceMs ?? DEFAULT_INCOMPLETE_GRACE_MS));
+  }
+  currentTime() {
+    const result = this.now();
+    if (!Number.isFinite(result)) throw new SharedQuotaStoreError("Shared quota store clock returned an invalid time");
+    return result;
+  }
+  nextToken() {
+    const result = this.token();
+    if (!SAFE_TOKEN.test(result)) throw new SharedQuotaStoreError("Shared quota store token is invalid");
+    return result;
+  }
+  markerName(owner) {
+    return `owner-${owner}.json`;
+  }
+  async ensureDirectory() {
+    try {
+      await mkdir(this.paths.directory, { recursive: true, mode: 448 });
+    } catch (error) {
+      throw new SharedQuotaStoreError(`Unable to create shared quota directory: ${message(error)}`, { cause: error });
+    }
+  }
+  async read() {
+    let raw;
+    try {
+      raw = await readFile(this.paths.cache, "utf8");
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return void 0;
+      throw new SharedQuotaStoreError(`Unable to read shared quota cache: ${message(error)}`, { cause: error });
+    }
+    if (Buffer.byteLength(raw, "utf8") > MAX_CACHE_BYTES) {
+      throw new InvalidSharedQuotaCacheError("Shared quota cache is too large");
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new InvalidSharedQuotaCacheError("Shared quota cache contains invalid JSON", { cause: error });
+    }
+    const source = record(parsed);
+    if (source.schemaVersion !== CACHE_SCHEMA_VERSION) {
+      throw new InvalidSharedQuotaCacheError("Shared quota cache has an unsupported schema version");
+    }
+    return quotaCache({
+      reports: source.reports,
+      updatedAt: source.updatedAt,
+      checkedAt: source.checkedAt,
+      retryAt: source.retryAt,
+      failures: source.failures,
+      error: source.error
+    });
+  }
+  async readMarker(name) {
+    if (!name.startsWith("owner-") || !name.endsWith(".json")) return void 0;
+    const path = join(this.paths.lock, name);
+    let stat;
+    let raw;
+    try {
+      stat = await lstat(path);
+      if (!stat.isFile()) return void 0;
+      if (stat.size > MAX_MARKER_BYTES) return void 0;
+      raw = await readFile(path, "utf8");
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return void 0;
+      throw error;
+    }
+    if (Buffer.byteLength(raw, "utf8") > MAX_MARKER_BYTES) return void 0;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return void 0;
+    }
+    const source = record(parsed);
+    const owner = string(source.owner);
+    const ttlMs = number(source.ttlMs);
+    if (source.schemaVersion !== CACHE_SCHEMA_VERSION || !owner || !SAFE_TOKEN.test(owner) || this.markerName(owner) !== name || ttlMs === void 0 || ttlMs <= 0) {
+      return void 0;
+    }
+    return {
+      name,
+      path,
+      marker: { schemaVersion: CACHE_SCHEMA_VERSION, owner, ttlMs },
+      stat
+    };
+  }
+  async lockEntries() {
+    try {
+      return await readdir(this.paths.lock, { withFileTypes: true });
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return void 0;
+      throw error;
+    }
+  }
+  async recoverStaleMarker(snapshot) {
+    const entries = await this.lockEntries();
+    if (!entries || entries.length !== 1 || entries[0]?.name !== snapshot.name) return false;
+    const current = await this.readMarker(snapshot.name);
+    if (!current || current.marker.owner !== snapshot.marker.owner || !sameStat(current.stat, snapshot.stat)) return false;
+    if (this.currentTime() < current.stat.mtimeMs + current.marker.ttlMs) return false;
+    if (!await safeUnlink(current.path)) return true;
+    return safeRmdir(this.paths.lock);
+  }
+  async recoverIncompleteLock(entries) {
+    if (!entries) return true;
+    let directoryStat;
+    try {
+      directoryStat = await lstat(this.paths.lock);
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return true;
+      throw error;
+    }
+    if (!directoryStat.isDirectory()) {
+      throw new SharedQuotaStoreError("Shared quota lock path is not a directory");
+    }
+    const snapshots = [];
+    let newest = directoryStat.mtimeMs;
+    for (const entry of entries) {
+      const path = join(this.paths.lock, entry.name);
+      let stat;
+      try {
+        stat = await lstat(path);
+      } catch (error) {
+        if (hasCode(error, "ENOENT")) return false;
+        throw error;
+      }
+      newest = Math.max(newest, stat.mtimeMs);
+      snapshots.push({ name: entry.name, path, stat });
+    }
+    if (this.currentTime() < newest + this.incompleteGraceMs) return false;
+    if (snapshots.some((item) => !item.stat.isFile())) {
+      throw new SharedQuotaStoreError("Shared quota lock contains an unsafe incomplete entry");
+    }
+    const latestEntries = await this.lockEntries();
+    if (!latestEntries) return true;
+    const expectedNames = snapshots.map((item) => item.name).sort();
+    const latestNames = latestEntries.map((item) => item.name).sort();
+    if (expectedNames.length !== latestNames.length || expectedNames.some((name, index) => name !== latestNames[index])) {
+      return false;
+    }
+    for (const snapshot of snapshots) {
+      let current;
+      try {
+        current = await lstat(snapshot.path);
+      } catch (error) {
+        if (hasCode(error, "ENOENT")) return false;
+        throw error;
+      }
+      if (!sameStat(snapshot.stat, current)) return false;
+    }
+    for (const snapshot of snapshots) {
+      if (!await safeUnlink(snapshot.path)) return false;
+    }
+    return safeRmdir(this.paths.lock);
+  }
+  async recoverExistingLock() {
+    let directoryStat;
+    try {
+      directoryStat = await lstat(this.paths.lock);
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return true;
+      throw error;
+    }
+    if (!directoryStat.isDirectory()) {
+      throw new SharedQuotaStoreError("Shared quota lock path is not a directory");
+    }
+    const entries = await this.lockEntries();
+    if (!entries) return true;
+    if (entries.length === 1) {
+      const marker = await this.readMarker(entries[0].name);
+      if (marker) {
+        if (this.currentTime() < marker.stat.mtimeMs + marker.marker.ttlMs) return false;
+        return this.recoverStaleMarker(marker);
+      }
+    }
+    return this.recoverIncompleteLock(entries);
+  }
+  async acquireLease(ttlMs) {
+    const normalizedTTL = Math.floor(ttlMs);
+    if (!Number.isFinite(normalizedTTL) || normalizedTTL <= 0) {
+      throw new SharedQuotaStoreError("Shared quota lease TTL is invalid");
+    }
+    await this.ensureDirectory();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        await mkdir(this.paths.lock, { mode: 448 });
+      } catch (error) {
+        if (!hasCode(error, "EEXIST")) {
+          throw new SharedQuotaStoreError(`Unable to acquire shared quota lock: ${message(error)}`, { cause: error });
+        }
+        try {
+          if (await this.recoverExistingLock()) continue;
+          return void 0;
+        } catch (recoveryError) {
+          if (recoveryError instanceof SharedQuotaStoreError) throw recoveryError;
+          throw new SharedQuotaStoreError(`Unable to inspect shared quota lock: ${message(recoveryError)}`, {
+            cause: recoveryError
+          });
+        }
+      }
+      const owner = this.nextToken();
+      const markerPath = join(this.paths.lock, this.markerName(owner));
+      try {
+        await writeExclusiveSynced(
+          markerPath,
+          `${JSON.stringify({ schemaVersion: CACHE_SCHEMA_VERSION, owner, ttlMs: normalizedTTL })}
+`
+        );
+        const now = new Date(this.currentTime());
+        await utimes(markerPath, now, now);
+      } catch (error) {
+        try {
+          await safeUnlink(markerPath);
+          await safeRmdir(this.paths.lock);
+        } catch {
+        }
+        throw new SharedQuotaStoreError(`Unable to create shared quota lease marker: ${message(error)}`, { cause: error });
+      }
+      const lease = new FileQuotaLease(this, owner);
+      this.leases.add(lease);
+      return lease;
+    }
+    return void 0;
+  }
+  async ownedMarker(owner, allowExpired) {
+    const expected = this.markerName(owner);
+    const entries = await this.lockEntries();
+    if (!entries || entries.length !== 1 || entries[0]?.name !== expected) return void 0;
+    const marker = await this.readMarker(expected);
+    if (!marker) throw new SharedQuotaStoreError("Shared quota lease marker is invalid");
+    if (marker.marker.owner !== owner) return void 0;
+    if (!allowExpired && this.currentTime() >= marker.stat.mtimeMs + marker.marker.ttlMs) return void 0;
+    return marker;
+  }
+  async renewLease(owner) {
+    const marker = await this.ownedMarker(owner, false);
+    if (!marker) return false;
+    const now = new Date(this.currentTime());
+    try {
+      await utimes(marker.path, now, now);
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return false;
+      throw new SharedQuotaStoreError(`Unable to renew shared quota lease: ${message(error)}`, { cause: error });
+    }
+    const confirmed = await this.ownedMarker(owner, false);
+    return Boolean(confirmed);
+  }
+  async releaseLease(owner) {
+    const marker = await this.ownedMarker(owner, true);
+    if (!marker) return false;
+    const current = await this.readMarker(marker.name);
+    if (!current || current.marker.owner !== owner || !sameStat(marker.stat, current.stat)) return false;
+    try {
+      if (!await safeUnlink(marker.path)) return false;
+      if (!await safeRmdir(this.paths.lock)) {
+        throw new SharedQuotaStoreError("Shared quota lock was not empty during release");
+      }
+      return true;
+    } catch (error) {
+      if (error instanceof SharedQuotaStoreError) throw error;
+      throw new SharedQuotaStoreError(`Unable to release shared quota lease: ${message(error)}`, { cause: error });
+    }
+  }
+  async renameCache(tempPath) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rename(tempPath, this.paths.cache);
+        return;
+      } catch (error) {
+        if (attempt >= 3 || !hasCode(error, "EACCES", "EBUSY", "EEXIST", "EPERM")) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt));
+      }
+    }
+  }
+  async write(value, lease) {
+    if (!this.leases.has(lease)) throw new LeaseLostError("Shared quota lease belongs to another store");
+    await this.ensureDirectory();
+    const payload = `${JSON.stringify(diskCache(value))}
+`;
+    let tempPath;
+    try {
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        this.tempSequence += 1;
+        const candidate = join(
+          this.paths.directory,
+          `.${CACHE_FILE}.${lease.owner}.${process.pid}.${this.tempSequence}.${this.nextToken()}.tmp`
+        );
+        try {
+          await writeExclusiveSynced(candidate, payload);
+          tempPath = candidate;
+          break;
+        } catch (error) {
+          if (!hasCode(error, "EEXIST")) {
+            tempPath = candidate;
+            throw error;
+          }
+        }
+      }
+      if (!tempPath) throw new SharedQuotaStoreError("Unable to allocate a unique shared quota cache temp file");
+      if (!await lease.renew()) throw new LeaseLostError();
+      await this.renameCache(tempPath);
+      tempPath = void 0;
+    } catch (error) {
+      if (error instanceof SharedQuotaStoreError) throw error;
+      throw new SharedQuotaStoreError(`Unable to write shared quota cache: ${message(error)}`, { cause: error });
+    } finally {
+      if (tempPath) {
+        try {
+          await safeUnlink(tempPath);
+        } catch {
+        }
+      }
+    }
+  }
+  async initializeFromLegacy(value, ttlMs) {
+    const existing = await this.read();
+    if (existing) return { cache: existing, migrated: false, busy: false };
+    const legacy = quotaCache(value);
+    const lease = await this.acquireLease(ttlMs);
+    if (!lease) {
+      const winner = await this.read();
+      return { cache: winner, migrated: false, busy: !winner };
+    }
+    let result;
+    let failure;
+    try {
+      const winner = await this.read();
+      if (winner) result = { cache: winner, migrated: false, busy: false };
+      else {
+        await this.write(legacy, lease);
+        result = { cache: legacy, migrated: true, busy: false };
+      }
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      const released = await lease.release();
+      if (!released && !failure) failure = new SharedQuotaStoreError("Shared quota migration lease was lost");
+    } catch (error) {
+      if (!failure) failure = error;
+    }
+    if (failure) throw failure;
+    return result;
+  }
+};
+function createSharedQuotaStore(options) {
+  return new SharedQuotaStore(options);
+}
+
 // index.tsx
 import { jsx, jsxs } from "@opentui/solid/jsx-runtime";
 var DEFAULT_REFRESH_MS = 6e5;
 var DEFAULT_TIMEOUT_MS = 2e4;
 var DEFAULT_BACKOFF_MS = 3e5;
 var MAX_BACKOFF_MS = 36e5;
-var CACHE_KEY = "cpa-quota-sidebar.cache.v2";
+var LEGACY_CACHE_KEY = "cpa-quota-sidebar.cache.v2";
+var SHARED_SYNC_MS = 5e3;
+var STORAGE_RETRY_MS = 5e3;
+var LOCK_RETRY_MS = 1e3;
 var PROVIDER_ORDER = { codex: 0, claude: 1, grok: 2 };
 var PLAN_KEYS = /* @__PURE__ */ new Set([
   "plan",
@@ -56,27 +600,15 @@ var PLAN_KEYS = /* @__PURE__ */ new Set([
   "tier_name",
   "tiername"
 ]);
-function record(value) {
+function record2(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
-function number(value) {
+function number2(value) {
   const result = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   return Number.isFinite(result) ? result : void 0;
 }
-function string(value) {
+function string2(value) {
   return typeof value === "string" && value.trim() ? value.trim() : void 0;
-}
-function quotaCache(value) {
-  const source = record(value);
-  return {
-    reports: Array.isArray(source.reports) ? source.reports : [],
-    updatedAt: number(source.updatedAt),
-    checkedAt: number(source.checkedAt),
-    retryAt: number(source.retryAt),
-    failures: number(source.failures) ?? 0,
-    leaseOwner: string(source.leaseOwner),
-    leaseUntil: number(source.leaseUntil)
-  };
 }
 function rateLimited(value) {
   return Boolean(value && /(?:429|rate[ -]?limit)/i.test(value));
@@ -95,7 +627,7 @@ function mergeReports(reports, previous) {
   });
 }
 function clampPercent(value) {
-  const result = number(value);
+  const result = number2(value);
   if (result === void 0) return void 0;
   return Math.min(100, Math.max(0, result));
 }
@@ -106,7 +638,7 @@ function shortAccount(value) {
   const name = value.split(/[\\/]/).at(-1) ?? value;
   return name.length > 18 ? `${name.slice(0, 15)}\u2026` : name;
 }
-function providerKind(file) {
+function providerKind2(file) {
   const value = [file.provider, file.type, file.name].filter(Boolean).join(" ").toLowerCase();
   if (value.includes("codex") || value.includes("openai")) return "codex";
   if (value.includes("claude") || value.includes("anthropic")) return "claude";
@@ -119,10 +651,10 @@ function providerTitle(kind) {
   return "Grok";
 }
 function accountLabel(file) {
-  const source = record(file);
-  const metadata = record(source.metadata);
+  const source = record2(file);
+  const metadata = record2(source.metadata);
   return shortAccount(
-    string(source.email) ?? string(metadata.email) ?? string(source.account) ?? string(source.name) ?? providerTitle(providerKind(file) ?? "codex")
+    string2(source.email) ?? string2(metadata.email) ?? string2(source.account) ?? string2(source.name) ?? providerTitle(providerKind2(file) ?? "codex")
   );
 }
 function decodeJWT(value) {
@@ -133,7 +665,7 @@ function decodeJWT(value) {
   try {
     const base64 = part.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(part.length / 4) * 4, "=");
     const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
-    return record(JSON.parse(new TextDecoder().decode(bytes)));
+    return record2(JSON.parse(new TextDecoder().decode(bytes)));
   } catch {
     return void 0;
   }
@@ -142,7 +674,7 @@ function findNestedString(value, keys, depth = 0) {
   if (depth > 7 || !value || typeof value !== "object") return void 0;
   for (const [key, item] of Object.entries(value)) {
     if (keys.has(key.toLowerCase())) {
-      const result = string(item);
+      const result = string2(item);
       if (result) return result;
     }
   }
@@ -156,10 +688,10 @@ function findPlan(value, depth = 0) {
   if (depth > 7 || !value || typeof value !== "object") return void 0;
   for (const [key, item] of Object.entries(value)) {
     if (!PLAN_KEYS.has(key.toLowerCase())) continue;
-    const direct = string(item);
+    const direct = string2(item);
     if (direct) return direct;
-    const nested = record(item);
-    const named = string(nested.name) ?? string(nested.label) ?? string(nested.tier) ?? string(nested.type);
+    const nested = record2(item);
+    const named = string2(nested.name) ?? string2(nested.label) ?? string2(nested.tier) ?? string2(nested.type);
     if (named) return named;
   }
   for (const item of Object.values(value)) {
@@ -180,13 +712,13 @@ function displayPlan(kind, fetched, configured) {
     if (kind === "codex" && fetched.toLowerCase() === "pro") return "Pro 20x";
     return fetched;
   }
-  return string(configured);
+  return string2(configured);
 }
 function chatGPTAccountID(file) {
   const direct = findNestedString(file, /* @__PURE__ */ new Set(["chatgpt_account_id", "chatgptaccountid"]));
   if (direct) return direct;
-  const source = record(file);
-  const metadata = record(source.metadata);
+  const source = record2(file);
+  const metadata = record2(source.metadata);
   return findNestedString(decodeJWT(source.id_token), /* @__PURE__ */ new Set(["chatgpt_account_id", "chatgptaccountid"])) ?? findNestedString(decodeJWT(metadata.id_token), /* @__PURE__ */ new Set(["chatgpt_account_id", "chatgptaccountid"]));
 }
 function compactDate(timestamp) {
@@ -199,7 +731,7 @@ function compactDate(timestamp) {
   return `${month}/${day} ${hour}:${minute}`;
 }
 function resetLabel(value, afterSeconds) {
-  const after = number(afterSeconds);
+  const after = number2(afterSeconds);
   let target;
   if (after !== void 0) target = Date.now() + Math.max(0, after) * 1e3;
   if (target === void 0 && typeof value === "number") target = value > 1e10 ? value : value * 1e3;
@@ -248,7 +780,7 @@ async function managementCall(input) {
     },
     input.timeoutMs
   );
-  const status = number(envelope.status_code ?? envelope.statusCode) ?? 0;
+  const status = number2(envelope.status_code ?? envelope.statusCode) ?? 0;
   if (status < 200 || status >= 300) throw new Error(`upstream HTTP ${status || "error"}`);
   const raw = envelope.body;
   let body = raw;
@@ -259,18 +791,18 @@ async function managementCall(input) {
       throw new Error("upstream returned invalid JSON");
     }
   }
-  return { body: record(body), headers: record(envelope.header ?? envelope.headers) };
+  return { body: record2(body), headers: record2(envelope.header ?? envelope.headers) };
 }
 function authIndex(file) {
   const result = file.auth_index;
   if (typeof result === "number") return String(result);
-  return string(result);
+  return string2(result);
 }
 function codexWindow(value, fallback) {
-  const window = record(value);
+  const window = record2(value);
   const used = clampPercent(window.used_percent ?? window.usedPercent);
   if (used === void 0) return void 0;
-  const seconds = number(window.limit_window_seconds ?? window.limitWindowSeconds);
+  const seconds = number2(window.limit_window_seconds ?? window.limitWindowSeconds);
   const label = seconds && seconds >= 5e5 ? "7d" : seconds && seconds >= 14e3 ? "5h" : fallback;
   return {
     id: label,
@@ -298,7 +830,7 @@ async function fetchCodex(file, baseURL, key, timeoutMs) {
     url: "https://chatgpt.com/backend-api/wham/usage",
     headers
   });
-  const rate = record(result.body.rate_limit ?? result.body.rateLimit);
+  const rate = record2(result.body.rate_limit ?? result.body.rateLimit);
   const windows = [codexWindow(rate.primary_window ?? rate.primaryWindow, "5h"), codexWindow(rate.secondary_window ?? rate.secondaryWindow, "7d")].filter(
     (item) => Boolean(item)
   );
@@ -306,12 +838,12 @@ async function fetchCodex(file, baseURL, key, timeoutMs) {
   return {
     kind: "codex",
     account: accountLabel(file),
-    plan: string(result.body.plan_type ?? result.body.planType) ?? planLabel(result.body, result.headers, file),
+    plan: string2(result.body.plan_type ?? result.body.planType) ?? planLabel(result.body, result.headers, file),
     windows
   };
 }
 function claudeWindow(body, id, label) {
-  const value = record(body[id]);
+  const value = record2(body[id]);
   const used = clampPercent(value.utilization ?? value.percent);
   if (used === void 0) return void 0;
   return { id, label, used, reset: resetLabel(value.resets_at ?? value.reset_at ?? value.resetsAt) };
@@ -377,24 +909,24 @@ async function fetchGrok(file, baseURL, key, timeoutMs) {
     })
   ]);
   if (weekly.status === "rejected" && monthly.status === "rejected") throw new Error("billing endpoint unavailable");
-  const weeklyBody = weekly.status === "fulfilled" ? record(weekly.value.body.config ?? weekly.value.body) : {};
-  const monthlyBody = monthly.status === "fulfilled" ? record(monthly.value.body.config ?? monthly.value.body) : {};
+  const weeklyBody = weekly.status === "fulfilled" ? record2(weekly.value.body.config ?? weekly.value.body) : {};
+  const monthlyBody = monthly.status === "fulfilled" ? record2(monthly.value.body.config ?? monthly.value.body) : {};
   const windows = [];
   const weeklyUsed = clampPercent(weeklyBody.creditUsagePercent ?? weeklyBody.credit_usage_percent);
-  const period = record(weeklyBody.currentPeriod ?? weeklyBody.current_period);
+  const period = record2(weeklyBody.currentPeriod ?? weeklyBody.current_period);
   if (weeklyUsed !== void 0) {
     windows.push({ id: "weekly", label: "Week", used: weeklyUsed, reset: resetLabel(period.end) });
   }
   const products = Array.isArray(weeklyBody.productUsage ?? weeklyBody.product_usage) ? weeklyBody.productUsage ?? weeklyBody.product_usage : [];
   for (const raw of products.slice(0, 2)) {
-    const product = record(raw);
+    const product = record2(raw);
     const used = clampPercent(product.usagePercent ?? product.usage_percent);
     if (used === void 0) continue;
-    const name = string(product.product) ?? "Product";
+    const name = string2(product.product) ?? "Product";
     windows.push({ id: `product-${name}`, label: name, used, reset: resetLabel(period.end) });
   }
-  const limit = number(record(monthlyBody.monthlyLimit ?? monthlyBody.monthly_limit).val);
-  const usedCredits = number(record(monthlyBody.used).val);
+  const limit = number2(record2(monthlyBody.monthlyLimit ?? monthlyBody.monthly_limit).val);
+  const usedCredits = number2(record2(monthlyBody.used).val);
   if (limit && usedCredits !== void 0) {
     windows.push({
       id: "monthly",
@@ -424,7 +956,7 @@ async function fetchReports(baseURL, key, timeoutMs) {
     timeoutMs
   );
   const files = Array.isArray(auth.files) ? auth.files : [];
-  const supported = files.map((file) => ({ file, kind: providerKind(file) })).filter((item) => item.kind);
+  const supported = files.map((file) => ({ file, kind: providerKind2(file) })).filter((item) => item.kind);
   if (!supported.length) throw new Error("no supported CPA auth files");
   return Promise.all(
     supported.map(async ({ file, kind }) => {
@@ -481,6 +1013,7 @@ function QuotaView(props) {
     ] }),
     /* @__PURE__ */ jsx(Show, { when: props.state.status === "loading" && !props.state.reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "Loading subscription usage\u2026" }) }),
     /* @__PURE__ */ jsx(Show, { when: props.state.status === "error" && !props.state.reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.error, children: props.state.error ?? "Quota unavailable" }) }),
+    /* @__PURE__ */ jsx(Show, { when: props.state.error && !props.state.reports.length && props.state.status !== "error", children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.error, children: props.state.error }) }),
     /* @__PURE__ */ jsx(Show, { when: props.state.error && props.state.reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: props.state.error }) }),
     /* @__PURE__ */ jsx("box", { width: "100%", gap: 1, children: /* @__PURE__ */ jsx(For, { each: reports(), children: (report) => /* @__PURE__ */ jsxs("box", { width: "100%", children: [
       /* @__PURE__ */ jsxs("box", { width: "100%", flexDirection: "row", justifyContent: "space-between", children: [
@@ -508,33 +1041,62 @@ function QuotaView(props) {
 var tui = async (api, rawOptions) => {
   const autoMode = process.argv.includes("--auto");
   const options = rawOptions ?? {};
-  const rawBaseURL = string(options.baseURL);
+  const rawBaseURL = string2(options.baseURL);
   const baseURL = rawBaseURL ? normalizeBaseURL(rawBaseURL) : void 0;
-  const refreshMs = clampRefreshMs(number(options.refreshMs) ?? DEFAULT_REFRESH_MS);
-  const timeoutMs = Math.max(5e3, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS);
-  const backoffMs = Math.max(6e4, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS);
-  const leaseMs = timeoutMs * 2 + 1e4;
+  const refreshMs = clampRefreshMs(number2(options.refreshMs) ?? DEFAULT_REFRESH_MS);
+  const timeoutMs = Math.max(5e3, number2(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS);
+  const backoffMs = Math.max(6e4, number2(options.backoffMs) ?? DEFAULT_BACKOFF_MS);
+  const leaseMs = timeoutMs * 2 + 15e3;
   const automaticPolling = shouldPollAutomatically(autoMode, options.pollInAutoMode === true);
-  const key = string(options.managementKey);
-  const planLabels = record(options.planLabels);
-  const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const readCache = () => quotaCache(api.kv.get(CACHE_KEY, {}));
-  const writeCache = (value) => api.kv.set(CACHE_KEY, value);
-  const initialCache = readCache();
+  const key = string2(options.managementKey);
+  const planLabels = record2(options.planLabels);
+  const store = createSharedQuotaStore({ stateDir: api.state.path.state });
+  const legacyValue = api.kv.get(LEGACY_CACHE_KEY, {});
+  const legacyCache = quotaCache(legacyValue);
+  let initialCache = quotaCache({});
+  let initialStorageError;
+  let migrationPending = true;
+  try {
+    const initial = await store.initializeFromLegacy(legacyValue, leaseMs);
+    initialCache = initial.cache ?? initialCache;
+    migrationPending = initial.busy && !initial.cache;
+  } catch (error) {
+    initialStorageError = error instanceof Error ? error.message : "Shared quota cache initialization failed";
+    migrationPending = !(error instanceof InvalidSharedQuotaCacheError);
+  }
+  const configuredStatus = () => !baseURL ? "missing-base-url" : !key ? "missing-key" : "ready";
+  const cacheVersion = (cache) => cache.checkedAt ?? cache.updatedAt;
+  const stateFromCache = (cache, options2 = {}) => {
+    const error = options2.error ?? cache.error;
+    const configured = configuredStatus();
+    const loading = configured === "ready" && options2.loadingWhenEmpty === true && !error && cache.reports.length === 0 && cacheVersion(cache) === void 0;
+    const status = loading ? "loading" : sharedCacheDisplayStatus({
+      configuredStatus: configured,
+      readyStatus: "ready",
+      errorStatus: "error",
+      reportCount: cache.reports.length,
+      error
+    });
+    return {
+      status,
+      reports: cache.reports,
+      updatedAt: cache.updatedAt,
+      checkedAt: cache.checkedAt,
+      error
+    };
+  };
+  let latestCache = initialCache;
   const [state, setState] = createSignal(
-    !baseURL ? { status: "missing-base-url", reports: [] } : !key ? { status: "missing-key", reports: [] } : initialCache.reports.length ? {
-      status: "ready",
-      reports: initialCache.reports,
-      updatedAt: initialCache.updatedAt,
-      checkedAt: initialCache.checkedAt
-    } : { status: "loading", reports: [] }
+    stateFromCache(initialCache, { error: initialStorageError, loadingWhenEmpty: true })
   );
   const [refreshing, setRefreshing] = createSignal(false);
   let inflight;
   let scheduled;
   let refresh;
+  let storageErrorActive = Boolean(initialStorageError);
+  let storageProbeRequired = Boolean(initialStorageError);
   const scheduleRefresh = (delay) => {
-    if (!automaticPolling || api.lifecycle.signal.aborted) return;
+    if (api.lifecycle.signal.aborted) return;
     if (scheduled) clearTimeout(scheduled);
     scheduled = setTimeout(() => {
       scheduled = void 0;
@@ -543,158 +1105,332 @@ var tui = async (api, rawOptions) => {
   };
   const adoptCache = (cache) => {
     const current = state();
+    const currentVersion = current.checkedAt ?? current.updatedAt;
+    const sharedVersion = cacheVersion(cache);
+    let adopted;
     if (shouldAdoptCache({
       currentHasReports: current.reports.length > 0,
-      currentVersion: current.checkedAt ?? current.updatedAt,
+      currentVersion,
       cacheHasReports: cache.reports.length > 0,
-      cacheVersion: cache.checkedAt ?? cache.updatedAt
+      cacheVersion: sharedVersion
     })) {
-      setState({
-        status: "ready",
-        reports: cache.reports,
-        updatedAt: cache.updatedAt,
-        checkedAt: cache.checkedAt
+      adopted = cache;
+    } else if (sharedVersion !== void 0 && sharedVersion > (currentVersion ?? Number.NEGATIVE_INFINITY) || currentVersion === void 0 && Boolean(cache.error)) {
+      adopted = quotaCache({
+        reports: cache.reports.length ? cache.reports : current.reports,
+        updatedAt: cache.updatedAt ?? current.updatedAt,
+        checkedAt: cache.checkedAt ?? current.checkedAt,
+        retryAt: cache.retryAt,
+        failures: cache.failures,
+        error: cache.error
       });
     }
+    if (adopted) {
+      latestCache = adopted;
+      setState(stateFromCache(adopted, { error: storageErrorActive ? current.error : adopted.error }));
+    }
+    return latestCache;
   };
   const retryLabel = (timestamp) => new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const backoffDelay = (failures) => Math.min(MAX_BACKOFF_MS, backoffMs * 2 ** Math.min(8, Math.max(0, failures - 1)));
+  const scheduleFromCache = (cache, now = Date.now()) => {
+    if (!automaticPolling) {
+      scheduleRefresh(SHARED_SYNC_MS);
+      return;
+    }
+    if (cache.retryAt && cache.retryAt > now) {
+      scheduleRefresh(Math.min(SHARED_SYNC_MS, cache.retryAt - now + TIMER_SLACK_MS));
+      return;
+    }
+    const checkedAt = cacheVersion(cache);
+    if (checkedAt && now - checkedAt < refreshMs) {
+      scheduleRefresh(Math.min(SHARED_SYNC_MS, nextRefreshDelay(checkedAt, refreshMs, now)));
+      return;
+    }
+    scheduleRefresh(TIMER_SLACK_MS);
+  };
+  const markStorageError = (error, notify) => {
+    const message2 = error instanceof Error ? error.message : "Shared quota storage failed";
+    storageErrorActive = true;
+    storageProbeRequired = true;
+    setState((previous) => ({
+      ...previous,
+      status: previous.status === "missing-base-url" || previous.status === "missing-key" ? previous.status : previous.reports.length ? "ready" : "error",
+      error: message2
+    }));
+    scheduleRefresh(STORAGE_RETRY_MS);
+    if (notify) api.ui.toast({ variant: "error", title: "CPA quota", message: message2 });
+  };
+  const clearStorageError = () => {
+    if (!storageErrorActive) return;
+    storageErrorActive = false;
+    setState(stateFromCache(latestCache, { loadingWhenEmpty: true }));
+  };
+  const showRetryToast = (retryAt) => {
+    api.ui.toast({
+      variant: "warning",
+      title: "CPA quota",
+      message: `Rate limited; retry after ${retryLabel(retryAt)}`
+    });
+  };
+  const adoptAfterLeaseLoss = async (notify) => {
+    try {
+      const latest = await store.read();
+      if (latest) {
+        migrationPending = false;
+        adoptCache(latest);
+      }
+    } catch (error) {
+      markStorageError(error, notify);
+      return;
+    }
+    scheduleRefresh(LOCK_RETRY_MS);
+    if (notify) {
+      api.ui.toast({
+        variant: "warning",
+        title: "CPA quota",
+        message: "Another OpenCode process owns the quota refresh; waiting for its shared result"
+      });
+    }
+  };
   refresh = async (notify = false) => {
     if (inflight) return inflight;
     inflight = (async () => {
-      if (!baseURL) {
-        setState({ status: "missing-base-url", reports: [] });
-        return;
-      }
-      if (!key) {
-        setState({ status: "missing-key", reports: [] });
-        return;
-      }
-      const now = Date.now();
-      let cache = readCache();
-      adoptCache(cache);
-      if (cache.retryAt && cache.retryAt > now) {
-        scheduleRefresh(cache.retryAt - now + 250);
-        if (notify) {
-          api.ui.toast({
-            variant: "warning",
-            title: "CPA quota",
-            message: `Rate limited; retry after ${retryLabel(cache.retryAt)}`
-          });
-        }
-        return;
-      }
-      const retryDue = cache.retryAt !== void 0 && cache.retryAt <= now;
-      const lastCheck = cache.checkedAt ?? cache.updatedAt;
-      if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
-        scheduleRefresh(nextRefreshDelay(lastCheck, refreshMs, now));
-        return;
-      }
-      if (cache.leaseOwner && cache.leaseOwner !== instanceID && cache.leaseUntil && cache.leaseUntil > now) {
-        scheduleRefresh(Math.min(5e3, Math.max(750, cache.leaseUntil - now + 250)));
-        return;
-      }
-      writeCache({ ...cache, leaseOwner: instanceID, leaseUntil: now + leaseMs });
-      await new Promise((resolve) => setTimeout(resolve, 150 + Math.random() * 250));
-      cache = readCache();
-      if (cache.leaseOwner !== instanceID) {
-        scheduleRefresh(750 + Math.random() * 1e3);
-        return;
-      }
-      setRefreshing(true);
+      let cache = latestCache;
+      let sharedMissing = false;
       try {
-        const fetched = (await fetchReports(baseURL, key, timeoutMs)).map((report) => ({
-          ...report,
-          plan: displayPlan(report.kind, report.plan, planLabels[report.kind])
-        }));
-        if (api.lifecycle.signal.aborted) return;
-        const activeCache = readCache();
-        if (activeCache.leaseOwner !== instanceID) {
-          adoptCache(activeCache);
-          scheduleRefresh(750 + Math.random() * 1e3);
-          return;
-        }
-        cache = activeCache;
-        const limited = fetched.filter((report) => rateLimited(report.error));
-        const failures = limited.length ? cache.failures + 1 : 0;
-        const retryAt = limited.length ? Date.now() + backoffDelay(failures) : void 0;
-        const displayFetched = fetched.map(
-          (report) => rateLimited(report.error) && retryAt ? { ...report, error: `Rate limited \xB7 retry ${retryLabel(retryAt)}` } : report
-        );
-        const reports = mergeReports(displayFetched, cache.reports);
-        const complete = fetched.every((report) => !report.error);
-        const checkedAt = Date.now();
-        const updatedAt = complete ? checkedAt : cache.updatedAt ?? checkedAt;
-        writeCache({ reports, updatedAt, checkedAt, retryAt, failures });
-        setState({ status: "ready", reports, updatedAt, checkedAt });
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS);
-        else scheduleRefresh(refreshMs + TIMER_SLACK_MS);
-        if (notify) {
-          const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)));
-          api.ui.toast({
-            variant: limited.length ? "warning" : "success",
-            title: "CPA quota",
-            message: limited.length ? `${limited.map((report) => providerTitle(report.kind)).join(", ")} rate limited; ${cached ? "showing cached usage" : `retry after ${retryLabel(retryAt)}`}` : "Usage refreshed"
-          });
-        }
+        const shared = await store.read();
+        if (shared) {
+          migrationPending = false;
+          cache = adoptCache(shared);
+        } else sharedMissing = true;
       } catch (error) {
-        if (api.lifecycle.signal.aborted) return;
-        const activeCache = readCache();
-        if (activeCache.leaseOwner !== instanceID) {
-          adoptCache(activeCache);
-          scheduleRefresh(750 + Math.random() * 1e3);
+        markStorageError(error, notify);
+        cache = latestCache;
+      }
+      const allowUpstream = notify || automaticPolling;
+      const needsCoordination = storageProbeRequired || migrationPending || sharedMissing;
+      const beforeLockVersion = cacheVersion(cache);
+      const now = Date.now();
+      if (!needsCoordination) {
+        if (!baseURL || !key) {
+          setState((previous) => ({ ...previous, status: configuredStatus() }));
+          scheduleRefresh(SHARED_SYNC_MS);
           return;
         }
-        cache = activeCache;
-        const message = error instanceof Error ? error.message : "Quota refresh failed";
-        const limited = rateLimited(message);
-        const failures = limited ? cache.failures + 1 : cache.failures;
-        const retryAt = limited ? Date.now() + backoffDelay(failures) : void 0;
-        const checkedAt = Date.now();
-        writeCache({
-          reports: cache.reports,
-          updatedAt: cache.updatedAt,
-          checkedAt,
-          retryAt,
-          failures
-        });
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS);
-        else scheduleRefresh(refreshMs + TIMER_SLACK_MS);
-        setState((previous) => ({
-          status: previous.reports.length ? "ready" : "error",
-          reports: previous.reports,
-          updatedAt: previous.updatedAt,
-          checkedAt,
-          error: message
-        }));
-        if (notify) {
+        if (!allowUpstream) {
+          scheduleRefresh(SHARED_SYNC_MS);
+          return;
+        }
+        if (cache.retryAt && cache.retryAt > now) {
+          scheduleFromCache(cache, now);
+          if (notify) showRetryToast(cache.retryAt);
+          return;
+        }
+        const retryDue = cache.retryAt !== void 0 && cache.retryAt <= now;
+        const lastCheck = cacheVersion(cache);
+        if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
+          scheduleFromCache(cache, now);
+          return;
+        }
+      }
+      let lease;
+      let leaseLost = false;
+      let didSetRefreshing = false;
+      try {
+        try {
+          lease = await store.acquireLease(leaseMs);
+        } catch (error) {
+          markStorageError(error, notify);
+          return;
+        }
+        if (!lease) {
+          scheduleRefresh(LOCK_RETRY_MS);
+          if (notify) {
+            api.ui.toast({
+              variant: "warning",
+              title: "CPA quota",
+              message: "Another OpenCode process is refreshing quota usage"
+            });
+          }
+          return;
+        }
+        try {
+          let shared;
+          let readFailure;
+          try {
+            shared = await store.read();
+          } catch (error) {
+            readFailure = error;
+            markStorageError(error, notify && !storageErrorActive);
+          }
+          if (readFailure) {
+            if (!(readFailure instanceof InvalidSharedQuotaCacheError)) return;
+            cache = latestCache;
+            await store.write(cache, lease);
+            migrationPending = false;
+            storageProbeRequired = false;
+            clearStorageError();
+          } else if (shared) {
+            migrationPending = false;
+            cache = adoptCache(shared);
+            if (storageProbeRequired) {
+              await store.write(cache, lease);
+              storageProbeRequired = false;
+              clearStorageError();
+            }
+          } else {
+            cache = quotaCache(
+              selectMissingCacheFallback({
+                migrationPending,
+                legacy: legacyCache,
+                latest: latestCache
+              })
+            );
+            await store.write(cache, lease);
+            latestCache = cache;
+            migrationPending = false;
+            storageProbeRequired = false;
+            clearStorageError();
+            setState(stateFromCache(cache, { loadingWhenEmpty: true }));
+          }
+        } catch (error) {
+          if (error instanceof LeaseLostError) {
+            leaseLost = true;
+            await adoptAfterLeaseLoss(notify);
+          } else {
+            markStorageError(error, notify);
+          }
+          return;
+        }
+        if (!baseURL || !key) {
+          setState((previous) => ({ ...previous, status: configuredStatus() }));
+          scheduleRefresh(SHARED_SYNC_MS);
+          return;
+        }
+        if (!allowUpstream) {
+          scheduleRefresh(SHARED_SYNC_MS);
+          return;
+        }
+        const lockedNow = Date.now();
+        if (cache.retryAt && cache.retryAt > lockedNow) {
+          scheduleFromCache(cache, lockedNow);
+          if (notify) showRetryToast(cache.retryAt);
+          return;
+        }
+        const retryDue = cache.retryAt !== void 0 && cache.retryAt <= lockedNow;
+        const lockedVersion = cacheVersion(cache);
+        if (notify && lockedVersion !== void 0 && lockedVersion > (beforeLockVersion ?? Number.NEGATIVE_INFINITY)) {
+          scheduleFromCache(cache, lockedNow);
           api.ui.toast({
-            variant: limited ? "warning" : "error",
+            variant: "success",
             title: "CPA quota",
-            message: limited && retryAt ? `Rate limited; retry after ${retryLabel(retryAt)}` : message
+            message: "Usage was refreshed by another OpenCode process"
           });
+          return;
         }
+        if (!notify && !retryDue && lockedVersion && lockedNow - lockedVersion < refreshMs) {
+          scheduleFromCache(cache, lockedNow);
+          return;
+        }
+        setRefreshing(true);
+        didSetRefreshing = true;
+        let nextCache;
+        let nextState;
+        let toast;
+        try {
+          const fetched = (await fetchReports(baseURL, key, timeoutMs)).map((report) => ({
+            ...report,
+            plan: displayPlan(report.kind, report.plan, planLabels[report.kind])
+          }));
+          if (api.lifecycle.signal.aborted) return;
+          const limited = fetched.filter((report) => rateLimited(report.error));
+          const failures = limited.length ? cache.failures + 1 : 0;
+          const retryAt = limited.length ? Date.now() + backoffDelay(failures) : void 0;
+          const displayFetched = fetched.map(
+            (report) => rateLimited(report.error) && retryAt ? { ...report, error: `Rate limited \xB7 retry ${retryLabel(retryAt)}` } : report
+          );
+          const reports = mergeReports(displayFetched, cache.reports);
+          const complete = fetched.every((report) => !report.error);
+          const checkedAt = Date.now();
+          const updatedAt = complete ? checkedAt : cache.updatedAt ?? checkedAt;
+          nextCache = quotaCache({ reports, updatedAt, checkedAt, retryAt, failures });
+          nextState = stateFromCache(nextCache);
+          if (notify) {
+            const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)));
+            toast = {
+              variant: limited.length ? "warning" : "success",
+              message: limited.length ? `${limited.map((report) => providerTitle(report.kind)).join(", ")} rate limited; ${cached ? "showing cached usage" : `retry after ${retryLabel(retryAt)}`}` : "Usage refreshed"
+            };
+          }
+        } catch (error) {
+          if (api.lifecycle.signal.aborted) return;
+          const message2 = error instanceof Error ? error.message : "Quota refresh failed";
+          const limited = rateLimited(message2);
+          const failures = limited ? cache.failures + 1 : cache.failures;
+          const retryAt = limited ? Date.now() + backoffDelay(failures) : void 0;
+          const checkedAt = Date.now();
+          nextCache = quotaCache({
+            reports: cache.reports,
+            updatedAt: cache.updatedAt,
+            checkedAt,
+            retryAt,
+            failures,
+            error: message2
+          });
+          nextState = stateFromCache(nextCache);
+          if (notify) {
+            toast = {
+              variant: limited ? "warning" : "error",
+              message: limited && retryAt ? `Rate limited; retry after ${retryLabel(retryAt)}` : message2
+            };
+          }
+        }
+        try {
+          await store.write(nextCache, lease);
+        } catch (error) {
+          if (error instanceof LeaseLostError) {
+            leaseLost = true;
+            await adoptAfterLeaseLoss(notify);
+          } else {
+            markStorageError(error, notify);
+          }
+          return;
+        }
+        cache = nextCache;
+        latestCache = nextCache;
+        storageProbeRequired = false;
+        clearStorageError();
+        setState(nextState);
+        scheduleFromCache(nextCache);
+        if (toast) api.ui.toast({ ...toast, title: "CPA quota" });
       } finally {
-        const latest = readCache();
-        if (latest.leaseOwner === instanceID) {
-          writeCache({ ...latest, leaseOwner: void 0, leaseUntil: void 0 });
+        if (didSetRefreshing) setRefreshing(false);
+        if (lease && !leaseLost) {
+          try {
+            const released = await lease.release();
+            if (!released && !api.lifecycle.signal.aborted) {
+              markStorageError(new Error("Shared quota refresh lease was lost before release"), notify);
+            }
+          } catch (error) {
+            markStorageError(error, notify);
+          }
         }
-        setRefreshing(false);
       }
     })();
     try {
       await inflight;
     } catch (error) {
       if (!api.lifecycle.signal.aborted) {
-        const message = error instanceof Error ? error.message : "Quota refresh failed";
+        const message2 = error instanceof Error ? error.message : "Quota refresh failed";
         setState((previous) => ({
           ...previous,
           status: previous.reports.length ? "ready" : "error",
-          error: message
+          error: message2
         }));
-        scheduleRefresh(refreshMs + TIMER_SLACK_MS);
+        scheduleRefresh(STORAGE_RETRY_MS);
         if (notify) {
-          api.ui.toast({ variant: "error", title: "CPA quota", message });
+          api.ui.toast({ variant: "error", title: "CPA quota", message: message2 });
         }
       }
     } finally {

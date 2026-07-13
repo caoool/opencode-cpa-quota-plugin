@@ -9,6 +9,25 @@ export function shouldPollAutomatically(autoMode: boolean, pollInAutoMode: boole
   return !autoMode || pollInAutoMode
 }
 
+export function sharedCacheDisplayStatus<Status extends string>(input: {
+  configuredStatus: Status
+  readyStatus: Status
+  errorStatus: Status
+  reportCount: number
+  error?: string
+}) {
+  if (input.configuredStatus !== input.readyStatus) return input.configuredStatus
+  return input.error && input.reportCount === 0 ? input.errorStatus : input.readyStatus
+}
+
+export function selectMissingCacheFallback<Cache>(input: {
+  migrationPending: boolean
+  legacy: Cache
+  latest: Cache
+}) {
+  return input.migrationPending ? input.legacy : input.latest
+}
+
 export function snapshotSlotState<State>(state: () => State, refreshing: () => boolean) {
   return {
     state: state(),
