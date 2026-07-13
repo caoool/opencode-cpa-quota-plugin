@@ -1,16 +1,21 @@
-name: Publish to npm
+name: Publish new npm versions
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,6 +24,29 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
+      - name: Install an OIDC-capable npm CLI
+        run: npm install --global npm@11.18.0
       - run: npm ci
       - run: npm run check
-      - run: npm publish --access public --provenance
+      - name: Check whether this version is new
+        id: version
+        shell: bash
+        run: |
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+          echo "name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "version=${package_version}" >> "$GITHUB_OUTPUT"
+
+          if registry_result="$(npm view "${package_name}@${package_version}" version --json 2>&1)"; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "${package_name}@${package_version} is already published; skipping."
+          elif [[ "$registry_result" == *"E404"* ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "${package_name}@${package_version} is new and will be published."
+          else
+            echo "$registry_result" >&2
+            exit 1
+          fi
+      - name: Publish ${{ steps.version.outputs.name }}@${{ steps.version.outputs.version }}
+        if: steps.version.outputs.publish == 'true'
+        run: npm publish --access public --provenance

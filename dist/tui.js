@@ -447,7 +447,7 @@ function QuotaView(props) {
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "then restart OpenCode" })
     ] }),
     /* @__PURE__ */ jsxs(Show, { when: props.state().status === "missing-base-url", children: [
-      /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: "Set baseURL or CPA_BASE_URL" }),
+      /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: "Set baseURL in tui.json" }),
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "then restart OpenCode" })
     ] }),
     /* @__PURE__ */ jsx(Show, { when: props.state().status === "loading" && !props.state().reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "Loading subscription usage\u2026" }) }),
@@ -478,15 +478,13 @@ function QuotaView(props) {
 var tui = async (api, rawOptions) => {
   const autoMode = process.argv.includes("--auto");
   const options = rawOptions ?? {};
-  const rawBaseURL = string(options.baseURL ?? process.env.CPA_BASE_URL);
+  const rawBaseURL = string(options.baseURL);
   const baseURL = rawBaseURL ? normalizeBaseURL(rawBaseURL) : void 0;
   const refreshMs = Math.max(MIN_REFRESH_MS, number(options.refreshMs) ?? DEFAULT_REFRESH_MS);
   const timeoutMs = Math.max(5e3, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS);
   const backoffMs = Math.max(6e4, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS);
-  const managementKey = string(options.managementKey);
-  const managementKeyEnv = options.managementKeyEnv ?? "CPA_MANAGEMENT_KEY";
+  const key = string(options.managementKey);
   const planLabels = record(options.planLabels);
-  const key = managementKey ?? process.env[managementKeyEnv] ?? process.env.MANAGEMENT_PASSWORD;
   const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const readCache = () => quotaCache(api.kv.get(CACHE_KEY, {}));
   const writeCache = (value) => api.kv.set(CACHE_KEY, value);

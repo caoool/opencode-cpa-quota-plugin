@@ -27,9 +27,10 @@ Add the package to `~/.config/opencode/tui.json`. OpenCode installs npm TUI plug
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
     [
-      "opencode-cpa-quota-plugin@0.1.0",
+      "opencode-cpa-quota-plugin@0.2.0",
       {
-        "managementKeyEnv": "CPA_MANAGEMENT_KEY",
+        "baseURL": "https://your-cpa.example.com",
+        "managementKey": "your-management-key",
         "refreshMs": 600000,
         "planLabels": {
           "claude": "Max"
@@ -46,7 +47,7 @@ From your OpenCode configuration directory:
 
 ```sh
 cd ~/.config/opencode
-npm install github:caoool/opencode-cpa-quota-plugin#v0.1.0
+npm install github:caoool/opencode-cpa-quota-plugin#v0.2.0
 ```
 
 Register the installed package directory in `~/.config/opencode/tui.json`:
@@ -58,7 +59,8 @@ Register the installed package directory in `~/.config/opencode/tui.json`:
     [
       "./node_modules/opencode-cpa-quota-plugin",
       {
-        "managementKeyEnv": "CPA_MANAGEMENT_KEY",
+        "baseURL": "https://your-cpa.example.com",
+        "managementKey": "your-management-key",
         "refreshMs": 600000,
         "planLabels": {
           "claude": "Max"
@@ -71,23 +73,14 @@ Register the installed package directory in `~/.config/opencode/tui.json`:
 
 The directory entry is required for GitHub-only installation. A bare package spec asks OpenCode to download it from the npm registry instead.
 
-Then export the key before starting OpenCode:
-
-```sh
-export CPA_BASE_URL="<your-cpa-base-url>"
-export CPA_MANAGEMENT_KEY="your-management-key"
-opencode
-```
-
-You can alternatively set `managementKey` directly in the plugin options, but that stores the key as plaintext in `tui.json`.
+`baseURL` and `managementKey` are read directly as literal strings from `tui.json`. Keep this local configuration file private because it contains your management credential.
 
 ## Options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `baseURL` | none | CPA base URL without `/v1`. Required unless `CPA_BASE_URL` is set. |
-| `managementKeyEnv` | `CPA_MANAGEMENT_KEY` | Environment variable containing the management key. |
-| `managementKey` | none | Literal management key; environment variables are safer. |
+| `baseURL` | none | Literal CPA base URL without `/v1`. |
+| `managementKey` | none | Literal CPA management key. |
 | `refreshMs` | `600000` | Automatic refresh interval. Values below five minutes are clamped. |
 | `timeoutMs` | `20000` | Request timeout. |
 | `backoffMs` | `300000` | Initial rate-limit backoff, doubled up to one hour. |
@@ -110,4 +103,4 @@ The package exposes its TUI entry through `exports["./tui"]`.
 
 ## Publishing
 
-The repository includes `.github/workflows/publish.yml` for npm trusted publishing with GitHub Actions OIDC and provenance. Configure `caoool/opencode-cpa-quota-plugin` and that workflow as a trusted publisher in the npm package settings, then publish a GitHub release.
+The repository includes `.github/workflows/publish.yml` for npm trusted publishing with GitHub Actions OIDC and provenance. On each push to `main`, the publishing workflow runs the package checks, compares the version in `package.json` with npm, and publishes only when that exact version does not already exist. Manual runs are restricted to `main`, and no npm token is stored in GitHub.

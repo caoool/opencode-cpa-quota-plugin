@@ -50,7 +50,6 @@ type PluginOptions = {
   refreshMs?: number
   timeoutMs?: number
   managementKey?: string
-  managementKeyEnv?: string
   planLabels?: Partial<Record<ProviderKind, string>>
   backoffMs?: number
 }
@@ -565,7 +564,7 @@ function QuotaView(props: {
       </Show>
 
       <Show when={props.state().status === "missing-base-url"}>
-        <text fg={props.api.theme.current.warning}>Set baseURL or CPA_BASE_URL</text>
+        <text fg={props.api.theme.current.warning}>Set baseURL in tui.json</text>
         <text fg={props.api.theme.current.textMuted}>then restart OpenCode</text>
       </Show>
 
@@ -625,15 +624,13 @@ function QuotaView(props: {
 const tui: TuiPlugin = async (api, rawOptions) => {
   const autoMode = process.argv.includes("--auto")
   const options = (rawOptions ?? {}) as PluginOptions
-  const rawBaseURL = string(options.baseURL ?? process.env.CPA_BASE_URL)
+  const rawBaseURL = string(options.baseURL)
   const baseURL = rawBaseURL ? normalizeBaseURL(rawBaseURL) : undefined
   const refreshMs = Math.max(MIN_REFRESH_MS, number(options.refreshMs) ?? DEFAULT_REFRESH_MS)
   const timeoutMs = Math.max(5_000, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS)
   const backoffMs = Math.max(60_000, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS)
-  const managementKey = string(options.managementKey)
-  const managementKeyEnv = options.managementKeyEnv ?? "CPA_MANAGEMENT_KEY"
+  const key = string(options.managementKey)
   const planLabels = record(options.planLabels)
-  const key = managementKey ?? process.env[managementKeyEnv] ?? process.env.MANAGEMENT_PASSWORD
   const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
   const readCache = () => quotaCache(api.kv.get(CACHE_KEY, {}))
   const writeCache = (value: QuotaCache) => api.kv.set(CACHE_KEY, value)
