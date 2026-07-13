@@ -4,6 +4,12 @@
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createMemo, createSignal, For, Show } from "solid-js"
+import {
+  clampRefreshMs,
+  nextRefreshDelay,
+  shouldAdoptCache,
+  TIMER_SLACK_MS,
+} from "./refresh-schedule"
 
 type ProviderKind = "codex" | "claude" | "grok"
 
@@ -26,12 +32,14 @@ type QuotaState = {
   status: "loading" | "ready" | "missing-base-url" | "missing-key" | "error"
   reports: QuotaReport[]
   updatedAt?: number
+  checkedAt?: number
   error?: string
 }
 
 type QuotaCache = {
   reports: QuotaReport[]
   updatedAt?: number
+  checkedAt?: number
   retryAt?: number
   failures: number
   leaseOwner?: string
@@ -56,7 +64,6 @@ type PluginOptions = {
 
 const DEFAULT_REFRESH_MS = 600_000
 const DEFAULT_TIMEOUT_MS = 20_000
-const MIN_REFRESH_MS = 300_000
 const DEFAULT_BACKOFF_MS = 300_000
 const MAX_BACKOFF_MS = 3_600_000
 const CACHE_KEY = "cpa-quota-sidebar.cache.v2"
@@ -100,6 +107,7 @@ function quotaCache(value: unknown): QuotaCache {
   return {
     reports: Array.isArray(source.reports) ? (source.reports as QuotaReport[]) : [],
     updatedAt: number(source.updatedAt),
+    checkedAt: number(source.checkedAt),
     retryAt: number(source.retryAt),
     failures: number(source.failures) ?? 0,
     leaseOwner: string(source.leaseOwner),
@@ -122,7 +130,7 @@ function mergeReports(reports: QuotaReport[], previous: QuotaReport[]) {
   return reports.map((report) => {
     if (!report.error) return report
     const cached = cachedReport(report, previous)
-    return cached ? { ...cached, plan: report.plan ?? cached.plan } : report
+    return cached ? { ...cached, plan: report.plan ?? cached.plan, error: report.error } : report
   })
 }
 
@@ -533,8 +541,8 @@ function QuotaView(props: {
       (left, right) => PROVIDER_ORDER[left.kind] - PROVIDER_ORDER[right.kind] || left.account.localeCompare(right.account),
     ),
   )
-  const updated = createMemo(() => {
-    const value = props.state().updatedAt
+  const checked = createMemo(() => {
+    const value = props.state().checkedAt ?? props.state().updatedAt
     if (!value) return undefined
     return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
   })
@@ -546,7 +554,7 @@ function QuotaView(props: {
           <b>Quota</b>
         </text>
         <box flexDirection="row" alignItems="center" gap={1}>
-          <text fg={props.api.theme.current.textMuted}>{props.refreshing() ? "refreshing" : updated()}</text>
+          <text fg={props.api.theme.current.textMuted}>{props.refreshing() ? "refreshing" : checked()}</text>
           <box
             height={1}
             paddingX={1}
@@ -574,6 +582,10 @@ function QuotaView(props: {
 
       <Show when={props.state().status === "error" && !props.state().reports.length}>
         <text fg={props.api.theme.current.error}>{props.state().error ?? "Quota unavailable"}</text>
+      </Show>
+
+      <Show when={props.state().error && props.state().reports.length}>
+        <text fg={props.api.theme.current.warning}>{props.state().error}</text>
       </Show>
 
       <box width="100%" gap={1}>
@@ -626,9 +638,10 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const options = (rawOptions ?? {}) as PluginOptions
   const rawBaseURL = string(options.baseURL)
   const baseURL = rawBaseURL ? normalizeBaseURL(rawBaseURL) : undefined
-  const refreshMs = Math.max(MIN_REFRESH_MS, number(options.refreshMs) ?? DEFAULT_REFRESH_MS)
+  const refreshMs = clampRefreshMs(number(options.refreshMs) ?? DEFAULT_REFRESH_MS)
   const timeoutMs = Math.max(5_000, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS)
   const backoffMs = Math.max(60_000, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS)
+  const leaseMs = timeoutMs * 2 + 10_000
   const key = string(options.managementKey)
   const planLabels = record(options.planLabels)
   const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -641,7 +654,12 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       : !key
       ? { status: "missing-key", reports: [] }
       : initialCache.reports.length
-        ? { status: "ready", reports: initialCache.reports, updatedAt: initialCache.updatedAt }
+        ? {
+            status: "ready",
+            reports: initialCache.reports,
+            updatedAt: initialCache.updatedAt,
+            checkedAt: initialCache.checkedAt,
+          }
         : { status: "loading", reports: [] },
   )
   const [refreshing, setRefreshing] = createSignal(false)
@@ -650,8 +668,31 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   let refresh: (notify?: boolean) => Promise<void>
 
   const scheduleRefresh = (delay: number) => {
+    if (autoMode || api.lifecycle.signal.aborted) return
     if (scheduled) clearTimeout(scheduled)
-    scheduled = setTimeout(() => void refresh(false), Math.max(250, delay))
+    scheduled = setTimeout(() => {
+      scheduled = undefined
+      void refresh(false)
+    }, Math.max(TIMER_SLACK_MS, delay))
+  }
+
+  const adoptCache = (cache: QuotaCache) => {
+    const current = state()
+    if (
+      shouldAdoptCache({
+        currentHasReports: current.reports.length > 0,
+        currentVersion: current.checkedAt ?? current.updatedAt,
+        cacheHasReports: cache.reports.length > 0,
+        cacheVersion: cache.checkedAt ?? cache.updatedAt,
+      })
+    ) {
+      setState({
+        status: "ready",
+        reports: cache.reports,
+        updatedAt: cache.updatedAt,
+        checkedAt: cache.checkedAt,
+      })
+    }
   }
 
   const retryLabel = (timestamp: number) =>
@@ -674,9 +715,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
 
       const now = Date.now()
       let cache = readCache()
-      if (cache.reports.length && !state().reports.length) {
-        setState({ status: "ready", reports: cache.reports, updatedAt: cache.updatedAt })
-      }
+      adoptCache(cache)
 
       if (cache.retryAt && cache.retryAt > now) {
         scheduleRefresh(cache.retryAt - now + 250)
@@ -691,14 +730,18 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       }
 
       const retryDue = cache.retryAt !== undefined && cache.retryAt <= now
-      if (!notify && !retryDue && cache.updatedAt && now - cache.updatedAt < refreshMs) return
+      const lastCheck = cache.checkedAt ?? cache.updatedAt
+      if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
+        scheduleRefresh(nextRefreshDelay(lastCheck, refreshMs, now))
+        return
+      }
 
       if (cache.leaseOwner && cache.leaseOwner !== instanceID && cache.leaseUntil && cache.leaseUntil > now) {
         scheduleRefresh(Math.min(5_000, Math.max(750, cache.leaseUntil - now + 250)))
         return
       }
 
-      writeCache({ ...cache, leaseOwner: instanceID, leaseUntil: now + timeoutMs + 5_000 })
+      writeCache({ ...cache, leaseOwner: instanceID, leaseUntil: now + leaseMs })
       await new Promise((resolve) => setTimeout(resolve, 150 + Math.random() * 250))
       cache = readCache()
       if (cache.leaseOwner !== instanceID) {
@@ -713,6 +756,13 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           plan: displayPlan(report.kind, report.plan, planLabels[report.kind]),
         }))
         if (api.lifecycle.signal.aborted) return
+        const activeCache = readCache()
+        if (activeCache.leaseOwner !== instanceID) {
+          adoptCache(activeCache)
+          scheduleRefresh(750 + Math.random() * 1_000)
+          return
+        }
+        cache = activeCache
         const limited = fetched.filter((report) => rateLimited(report.error))
         const failures = limited.length ? cache.failures + 1 : 0
         const retryAt = limited.length ? Date.now() + backoffDelay(failures) : undefined
@@ -723,10 +773,12 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         )
         const reports = mergeReports(displayFetched, cache.reports)
         const complete = fetched.every((report) => !report.error)
-        const updatedAt = complete ? Date.now() : (cache.updatedAt ?? Date.now())
-        writeCache({ reports, updatedAt, retryAt, failures })
-        setState({ status: "ready", reports, updatedAt })
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + 250)
+        const checkedAt = Date.now()
+        const updatedAt = complete ? checkedAt : (cache.updatedAt ?? checkedAt)
+        writeCache({ reports, updatedAt, checkedAt, retryAt, failures })
+        setState({ status: "ready", reports, updatedAt, checkedAt })
+        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS)
+        else scheduleRefresh(refreshMs + TIMER_SLACK_MS)
         if (notify) {
           const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)))
           api.ui.toast({
@@ -739,21 +791,32 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         }
       } catch (error) {
         if (api.lifecycle.signal.aborted) return
+        const activeCache = readCache()
+        if (activeCache.leaseOwner !== instanceID) {
+          adoptCache(activeCache)
+          scheduleRefresh(750 + Math.random() * 1_000)
+          return
+        }
+        cache = activeCache
         const message = error instanceof Error ? error.message : "Quota refresh failed"
         const limited = rateLimited(message)
         const failures = limited ? cache.failures + 1 : cache.failures
         const retryAt = limited ? Date.now() + backoffDelay(failures) : undefined
+        const checkedAt = Date.now()
         writeCache({
           reports: cache.reports,
           updatedAt: cache.updatedAt,
+          checkedAt,
           retryAt,
           failures,
         })
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + 250)
+        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS)
+        else scheduleRefresh(refreshMs + TIMER_SLACK_MS)
         setState((previous) => ({
           status: previous.reports.length ? "ready" : "error",
           reports: previous.reports,
           updatedAt: previous.updatedAt,
+          checkedAt,
           error: message,
         }))
         if (notify) {
@@ -773,6 +836,19 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     })()
     try {
       await inflight
+    } catch (error) {
+      if (!api.lifecycle.signal.aborted) {
+        const message = error instanceof Error ? error.message : "Quota refresh failed"
+        setState((previous) => ({
+          ...previous,
+          status: previous.reports.length ? "ready" : "error",
+          error: message,
+        }))
+        scheduleRefresh(refreshMs + TIMER_SLACK_MS)
+        if (notify) {
+          api.ui.toast({ variant: "error", title: "CPA quota", message })
+        }
+      }
     } finally {
       inflight = undefined
     }
@@ -805,16 +881,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   ])
   if (unregisterCommand) api.lifecycle.onDispose(unregisterCommand)
 
-  const timer = autoMode ? undefined : setInterval(() => void refresh(false), refreshMs)
-  const initialTimer = autoMode
-    ? undefined
-    : setTimeout(
-        () => void refresh(false),
-        initialCache.reports.length ? 250 : 750 + Math.random() * 2_500,
-      )
+  scheduleRefresh(initialCache.reports.length ? TIMER_SLACK_MS : 750 + Math.random() * 2_500)
   api.lifecycle.onDispose(() => {
-    if (timer) clearInterval(timer)
-    if (initialTimer) clearTimeout(initialTimer)
     if (scheduled) clearTimeout(scheduled)
   })
 }

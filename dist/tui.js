@@ -1,9 +1,28 @@
 // index.tsx
 import { createMemo, createSignal, For, Show } from "solid-js";
+
+// refresh-schedule.ts
+var TIMER_SLACK_MS = 250;
+var MIN_REFRESH_MS = 6e4;
+function clampRefreshMs(value) {
+  return Math.max(MIN_REFRESH_MS, value);
+}
+function nextRefreshDelay(checkedAt, refreshMs, now) {
+  return Math.min(
+    refreshMs + TIMER_SLACK_MS,
+    Math.max(TIMER_SLACK_MS, checkedAt + refreshMs + TIMER_SLACK_MS - now)
+  );
+}
+function shouldAdoptCache(input) {
+  if (!input.cacheHasReports) return false;
+  if (!input.currentHasReports) return true;
+  return (input.cacheVersion ?? Number.NEGATIVE_INFINITY) > (input.currentVersion ?? Number.NEGATIVE_INFINITY);
+}
+
+// index.tsx
 import { jsx, jsxs } from "@opentui/solid/jsx-runtime";
 var DEFAULT_REFRESH_MS = 6e5;
 var DEFAULT_TIMEOUT_MS = 2e4;
-var MIN_REFRESH_MS = 3e5;
 var DEFAULT_BACKOFF_MS = 3e5;
 var MAX_BACKOFF_MS = 36e5;
 var CACHE_KEY = "cpa-quota-sidebar.cache.v2";
@@ -43,6 +62,7 @@ function quotaCache(value) {
   return {
     reports: Array.isArray(source.reports) ? source.reports : [],
     updatedAt: number(source.updatedAt),
+    checkedAt: number(source.checkedAt),
     retryAt: number(source.retryAt),
     failures: number(source.failures) ?? 0,
     leaseOwner: string(source.leaseOwner),
@@ -62,7 +82,7 @@ function mergeReports(reports, previous) {
   return reports.map((report) => {
     if (!report.error) return report;
     const cached = cachedReport(report, previous);
-    return cached ? { ...cached, plan: report.plan ?? cached.plan } : report;
+    return cached ? { ...cached, plan: report.plan ?? cached.plan, error: report.error } : report;
   });
 }
 function clampPercent(value) {
@@ -420,8 +440,8 @@ function QuotaView(props) {
       (left, right) => PROVIDER_ORDER[left.kind] - PROVIDER_ORDER[right.kind] || left.account.localeCompare(right.account)
     )
   );
-  const updated = createMemo(() => {
-    const value = props.state().updatedAt;
+  const checked = createMemo(() => {
+    const value = props.state().checkedAt ?? props.state().updatedAt;
     if (!value) return void 0;
     return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   });
@@ -429,7 +449,7 @@ function QuotaView(props) {
     /* @__PURE__ */ jsxs("box", { width: "100%", flexDirection: "row", justifyContent: "space-between", marginBottom: 1, children: [
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.text, children: /* @__PURE__ */ jsx("b", { children: "Quota" }) }),
       /* @__PURE__ */ jsxs("box", { flexDirection: "row", alignItems: "center", gap: 1, children: [
-        /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: props.refreshing() ? "refreshing" : updated() }),
+        /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: props.refreshing() ? "refreshing" : checked() }),
         /* @__PURE__ */ jsx(
           "box",
           {
@@ -452,6 +472,7 @@ function QuotaView(props) {
     ] }),
     /* @__PURE__ */ jsx(Show, { when: props.state().status === "loading" && !props.state().reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: "Loading subscription usage\u2026" }) }),
     /* @__PURE__ */ jsx(Show, { when: props.state().status === "error" && !props.state().reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.error, children: props.state().error ?? "Quota unavailable" }) }),
+    /* @__PURE__ */ jsx(Show, { when: props.state().error && props.state().reports.length, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: props.state().error }) }),
     /* @__PURE__ */ jsx("box", { width: "100%", gap: 1, children: /* @__PURE__ */ jsx(For, { each: reports(), children: (report) => /* @__PURE__ */ jsxs("box", { width: "100%", children: [
       /* @__PURE__ */ jsxs("box", { width: "100%", flexDirection: "row", justifyContent: "space-between", children: [
         /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.text, children: /* @__PURE__ */ jsx("b", { children: providerTitle(report.kind) }) }),
@@ -480,9 +501,10 @@ var tui = async (api, rawOptions) => {
   const options = rawOptions ?? {};
   const rawBaseURL = string(options.baseURL);
   const baseURL = rawBaseURL ? normalizeBaseURL(rawBaseURL) : void 0;
-  const refreshMs = Math.max(MIN_REFRESH_MS, number(options.refreshMs) ?? DEFAULT_REFRESH_MS);
+  const refreshMs = clampRefreshMs(number(options.refreshMs) ?? DEFAULT_REFRESH_MS);
   const timeoutMs = Math.max(5e3, number(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS);
   const backoffMs = Math.max(6e4, number(options.backoffMs) ?? DEFAULT_BACKOFF_MS);
+  const leaseMs = timeoutMs * 2 + 1e4;
   const key = string(options.managementKey);
   const planLabels = record(options.planLabels);
   const instanceID = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -490,15 +512,40 @@ var tui = async (api, rawOptions) => {
   const writeCache = (value) => api.kv.set(CACHE_KEY, value);
   const initialCache = readCache();
   const [state, setState] = createSignal(
-    !baseURL ? { status: "missing-base-url", reports: [] } : !key ? { status: "missing-key", reports: [] } : initialCache.reports.length ? { status: "ready", reports: initialCache.reports, updatedAt: initialCache.updatedAt } : { status: "loading", reports: [] }
+    !baseURL ? { status: "missing-base-url", reports: [] } : !key ? { status: "missing-key", reports: [] } : initialCache.reports.length ? {
+      status: "ready",
+      reports: initialCache.reports,
+      updatedAt: initialCache.updatedAt,
+      checkedAt: initialCache.checkedAt
+    } : { status: "loading", reports: [] }
   );
   const [refreshing, setRefreshing] = createSignal(false);
   let inflight;
   let scheduled;
   let refresh;
   const scheduleRefresh = (delay) => {
+    if (autoMode || api.lifecycle.signal.aborted) return;
     if (scheduled) clearTimeout(scheduled);
-    scheduled = setTimeout(() => void refresh(false), Math.max(250, delay));
+    scheduled = setTimeout(() => {
+      scheduled = void 0;
+      void refresh(false);
+    }, Math.max(TIMER_SLACK_MS, delay));
+  };
+  const adoptCache = (cache) => {
+    const current = state();
+    if (shouldAdoptCache({
+      currentHasReports: current.reports.length > 0,
+      currentVersion: current.checkedAt ?? current.updatedAt,
+      cacheHasReports: cache.reports.length > 0,
+      cacheVersion: cache.checkedAt ?? cache.updatedAt
+    })) {
+      setState({
+        status: "ready",
+        reports: cache.reports,
+        updatedAt: cache.updatedAt,
+        checkedAt: cache.checkedAt
+      });
+    }
   };
   const retryLabel = (timestamp) => new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const backoffDelay = (failures) => Math.min(MAX_BACKOFF_MS, backoffMs * 2 ** Math.min(8, Math.max(0, failures - 1)));
@@ -515,9 +562,7 @@ var tui = async (api, rawOptions) => {
       }
       const now = Date.now();
       let cache = readCache();
-      if (cache.reports.length && !state().reports.length) {
-        setState({ status: "ready", reports: cache.reports, updatedAt: cache.updatedAt });
-      }
+      adoptCache(cache);
       if (cache.retryAt && cache.retryAt > now) {
         scheduleRefresh(cache.retryAt - now + 250);
         if (notify) {
@@ -530,12 +575,16 @@ var tui = async (api, rawOptions) => {
         return;
       }
       const retryDue = cache.retryAt !== void 0 && cache.retryAt <= now;
-      if (!notify && !retryDue && cache.updatedAt && now - cache.updatedAt < refreshMs) return;
+      const lastCheck = cache.checkedAt ?? cache.updatedAt;
+      if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
+        scheduleRefresh(nextRefreshDelay(lastCheck, refreshMs, now));
+        return;
+      }
       if (cache.leaseOwner && cache.leaseOwner !== instanceID && cache.leaseUntil && cache.leaseUntil > now) {
         scheduleRefresh(Math.min(5e3, Math.max(750, cache.leaseUntil - now + 250)));
         return;
       }
-      writeCache({ ...cache, leaseOwner: instanceID, leaseUntil: now + timeoutMs + 5e3 });
+      writeCache({ ...cache, leaseOwner: instanceID, leaseUntil: now + leaseMs });
       await new Promise((resolve) => setTimeout(resolve, 150 + Math.random() * 250));
       cache = readCache();
       if (cache.leaseOwner !== instanceID) {
@@ -549,6 +598,13 @@ var tui = async (api, rawOptions) => {
           plan: displayPlan(report.kind, report.plan, planLabels[report.kind])
         }));
         if (api.lifecycle.signal.aborted) return;
+        const activeCache = readCache();
+        if (activeCache.leaseOwner !== instanceID) {
+          adoptCache(activeCache);
+          scheduleRefresh(750 + Math.random() * 1e3);
+          return;
+        }
+        cache = activeCache;
         const limited = fetched.filter((report) => rateLimited(report.error));
         const failures = limited.length ? cache.failures + 1 : 0;
         const retryAt = limited.length ? Date.now() + backoffDelay(failures) : void 0;
@@ -557,10 +613,12 @@ var tui = async (api, rawOptions) => {
         );
         const reports = mergeReports(displayFetched, cache.reports);
         const complete = fetched.every((report) => !report.error);
-        const updatedAt = complete ? Date.now() : cache.updatedAt ?? Date.now();
-        writeCache({ reports, updatedAt, retryAt, failures });
-        setState({ status: "ready", reports, updatedAt });
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + 250);
+        const checkedAt = Date.now();
+        const updatedAt = complete ? checkedAt : cache.updatedAt ?? checkedAt;
+        writeCache({ reports, updatedAt, checkedAt, retryAt, failures });
+        setState({ status: "ready", reports, updatedAt, checkedAt });
+        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS);
+        else scheduleRefresh(refreshMs + TIMER_SLACK_MS);
         if (notify) {
           const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)));
           api.ui.toast({
@@ -571,21 +629,32 @@ var tui = async (api, rawOptions) => {
         }
       } catch (error) {
         if (api.lifecycle.signal.aborted) return;
+        const activeCache = readCache();
+        if (activeCache.leaseOwner !== instanceID) {
+          adoptCache(activeCache);
+          scheduleRefresh(750 + Math.random() * 1e3);
+          return;
+        }
+        cache = activeCache;
         const message = error instanceof Error ? error.message : "Quota refresh failed";
         const limited = rateLimited(message);
         const failures = limited ? cache.failures + 1 : cache.failures;
         const retryAt = limited ? Date.now() + backoffDelay(failures) : void 0;
+        const checkedAt = Date.now();
         writeCache({
           reports: cache.reports,
           updatedAt: cache.updatedAt,
+          checkedAt,
           retryAt,
           failures
         });
-        if (retryAt) scheduleRefresh(retryAt - Date.now() + 250);
+        if (retryAt) scheduleRefresh(retryAt - Date.now() + TIMER_SLACK_MS);
+        else scheduleRefresh(refreshMs + TIMER_SLACK_MS);
         setState((previous) => ({
           status: previous.reports.length ? "ready" : "error",
           reports: previous.reports,
           updatedAt: previous.updatedAt,
+          checkedAt,
           error: message
         }));
         if (notify) {
@@ -605,6 +674,19 @@ var tui = async (api, rawOptions) => {
     })();
     try {
       await inflight;
+    } catch (error) {
+      if (!api.lifecycle.signal.aborted) {
+        const message = error instanceof Error ? error.message : "Quota refresh failed";
+        setState((previous) => ({
+          ...previous,
+          status: previous.reports.length ? "ready" : "error",
+          error: message
+        }));
+        scheduleRefresh(refreshMs + TIMER_SLACK_MS);
+        if (notify) {
+          api.ui.toast({ variant: "error", title: "CPA quota", message });
+        }
+      }
     } finally {
       inflight = void 0;
     }
@@ -635,14 +717,8 @@ var tui = async (api, rawOptions) => {
     }
   ]);
   if (unregisterCommand) api.lifecycle.onDispose(unregisterCommand);
-  const timer = autoMode ? void 0 : setInterval(() => void refresh(false), refreshMs);
-  const initialTimer = autoMode ? void 0 : setTimeout(
-    () => void refresh(false),
-    initialCache.reports.length ? 250 : 750 + Math.random() * 2500
-  );
+  scheduleRefresh(initialCache.reports.length ? TIMER_SLACK_MS : 750 + Math.random() * 2500);
   api.lifecycle.onDispose(() => {
-    if (timer) clearInterval(timer);
-    if (initialTimer) clearTimeout(initialTimer);
     if (scheduled) clearTimeout(scheduled);
   });
 };

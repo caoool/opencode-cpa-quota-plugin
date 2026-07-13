@@ -10,6 +10,9 @@ An OpenCode TUI sidebar plugin that displays subscription quota usage for Codex,
 - Supports plan labels returned by upstream APIs and optional configured fallbacks.
 - Provides a clickable refresh control and `/quota` command.
 - Uses persistent OpenCode KV caching, request leasing, and exponential backoff to avoid quota-endpoint rate limits.
+- Schedules each automatic refresh from the most recent completed refresh, so `refreshMs` is not accidentally doubled.
+- Adopts newer shared-cache results written by another OpenCode process.
+- Shows the latest check time while retaining visible warnings when cached provider data is used.
 - Suppresses background polling in `opencode --auto` workers while keeping cached UI available.
 
 ## Requirements
@@ -81,10 +84,12 @@ The directory entry is required for GitHub-only installation. A bare package spe
 | --- | --- | --- |
 | `baseURL` | none | Literal CPA base URL without `/v1`. |
 | `managementKey` | none | Literal CPA management key. |
-| `refreshMs` | `600000` | Automatic refresh interval. Values below five minutes are clamped. |
+| `refreshMs` | `600000` | Automatic refresh interval. Values below one minute are clamped. |
 | `timeoutMs` | `20000` | Request timeout. |
 | `backoffMs` | `300000` | Initial rate-limit backoff, doubled up to one hour. |
 | `planLabels` | `{}` | Fallback labels keyed by `codex`, `claude`, or `grok`. Fetched labels take priority. |
+
+Automatic polling is disabled in `opencode --auto` workers to prevent duplicate upstream requests. Interactive OpenCode processes refresh after `refreshMs`; values below one minute are clamped to one minute.
 
 ## Usage
 
