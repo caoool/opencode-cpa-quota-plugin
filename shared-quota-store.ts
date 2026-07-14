@@ -9,7 +9,7 @@ export type QuotaWindow = {
   id: string
   label: string
   used: number
-  reset?: string
+  resetAt?: number
 }
 
 export type QuotaReport = {
@@ -116,12 +116,12 @@ function quotaWindow(value: unknown): QuotaWindow | undefined {
   const label = string(source.label)
   const used = number(source.used)
   if (!id || !label || used === undefined) return undefined
-  const reset = string(source.reset)
+  const resetAt = number(source.resetAt)
   return {
     id,
     label,
     used: Math.min(100, Math.max(0, used)),
-    ...(reset ? { reset } : {}),
+    ...(resetAt === undefined ? {} : { resetAt }),
   }
 }
 

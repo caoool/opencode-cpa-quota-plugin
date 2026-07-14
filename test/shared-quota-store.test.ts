@@ -17,8 +17,28 @@ const report: QuotaReport = {
   kind: "claude",
   account: "account-a",
   plan: "Max",
-  windows: [{ id: "five_hour", label: "5h", used: 25, reset: "07/13 12:00" }],
+  windows: [{ id: "five_hour", label: "5h", used: 25, resetAt: 1_800_000_300_000 }],
 }
+
+test("keeps absolute reset timestamps and drops legacy server-formatted reset labels", () => {
+  assert.deepEqual(
+    quotaCache({
+      reports: [
+        {
+          ...report,
+          windows: [
+            { id: "absolute", label: "Absolute", used: 10, resetAt: "1800000300000" },
+            { id: "legacy", label: "Legacy", used: 20, reset: "07/13 12:00" },
+          ],
+        },
+      ],
+    }).reports[0]?.windows,
+    [
+      { id: "absolute", label: "Absolute", used: 10, resetAt: 1_800_000_300_000 },
+      { id: "legacy", label: "Legacy", used: 20 },
+    ],
+  )
+})
 
 function cache(checkedAt: number, used = 25): QuotaCache {
   return {

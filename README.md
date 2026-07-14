@@ -5,7 +5,7 @@ An OpenCode TUI sidebar plugin that displays subscription quota usage for Codex,
 ## Features
 
 - Shows Codex, Claude, and Grok quotas simultaneously.
-- Displays utilization percentages and reset timestamps.
+- Displays utilization percentages and reset timestamps in the current TUI process time zone.
 - Uses green, yellow, and red percentage thresholds.
 - Supports plan labels returned by upstream APIs and optional configured fallbacks.
 - Provides a clickable refresh control and `/quota` command.
@@ -96,7 +96,7 @@ Automatic upstream polling is disabled in `opencode --auto` workers by default. 
 
 ## Shared cache, lease, and privacy
 
-Version 0.2.5 stores shared state beneath OpenCode's `api.state.path.state` directory:
+Version 0.2.6 stores shared state beneath OpenCode's `api.state.path.state` directory:
 
 ```text
 <stateDir>/cpa-quota-sidebar/cache.v1.json
@@ -105,9 +105,9 @@ Version 0.2.5 stores shared state beneath OpenCode's `api.state.path.state` dire
 
 The cache is written through a synced `0600` temp file and atomic rename. Refresh ownership uses an atomic `0700` lock directory with a `0600` owner marker; stale or incomplete locks are recovered without recursive deletion. A corrupt, oversized, or wrong-schema cache is replaced with the latest normalized safe state only after a process acquires that lease and before it makes any upstream request. File modes are applied where the operating system supports them.
 
-The cache contains only normalized sidebar reports (including the displayed account labels), update/check timestamps, per-provider check/retry timing and failure counts, and an optional bounded error message from the latest total refresh failure. It does not store `baseURL`, `managementKey`, provider tokens, auth indexes, or credential payloads. The first file-backed-cache process migrates display cache fields from the legacy `cpa-quota-sidebar.cache.v2` OpenCode KV entry when no dedicated cache file exists. Legacy lease fields are ignored, and the old KV entry is neither rewritten nor deleted. If the dedicated file later disappears, the process rewrites its latest normalized shared/display state rather than replaying the process-start legacy snapshot.
+The cache contains only normalized sidebar reports (including the displayed account labels and absolute reset timestamps), update/check timestamps, per-provider check/retry timing and failure counts, and an optional bounded error message from the latest total refresh failure. Reset timestamps are formatted only when the sidebar renders, so a cache written by a server or worker does not impose that process's time zone on the TUI. It does not store `baseURL`, `managementKey`, provider tokens, auth indexes, or credential payloads. The first file-backed-cache process migrates display cache fields from the legacy `cpa-quota-sidebar.cache.v2` OpenCode KV entry when no dedicated cache file exists. Legacy lease fields are ignored, and the old KV entry is neither rewritten nor deleted. If the dedicated file later disappears, the process rewrites its latest normalized shared/display state rather than replaying the process-start legacy snapshot.
 
-**Upgrade requirement:** quit and restart every OpenCode process after installing 0.2.5. An older process does not understand per-provider backoff and can overwrite the shared scheduling state or issue requests for a provider that is still delayed.
+**Upgrade requirement:** quit and restart every OpenCode process after installing 0.2.6. Older processes cache reset times as preformatted server-local strings instead of absolute timestamps. Legacy cached reset labels are discarded and return after the next quota refresh.
 
 ## Usage
 

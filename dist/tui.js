@@ -1,6 +1,37 @@
 // index.tsx
 import { createMemo, createSignal, For, Show } from "solid-js";
 
+// quota-time.ts
+function number(value) {
+  const result = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(result) ? result : void 0;
+}
+function resetTimestamp(value, afterSeconds, now = Date.now()) {
+  const after = number(afterSeconds);
+  let target;
+  if (after !== void 0) target = now + Math.max(0, after) * 1e3;
+  if (target === void 0 && typeof value === "number") target = value > 1e10 ? value : value * 1e3;
+  if (target === void 0 && typeof value === "string") {
+    const numeric = Number(value);
+    target = Number.isFinite(numeric) ? numeric > 1e10 ? numeric : numeric * 1e3 : Date.parse(value);
+  }
+  return target !== void 0 && Number.isFinite(target) ? target : void 0;
+}
+function compactDate(timestamp) {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return void 0;
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  return `${month}/${day} ${hour}:${minute}`;
+}
+function compactTime(timestamp) {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return void 0;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 // refresh-schedule.ts
 var TIMER_SLACK_MS = 250;
 var MIN_REFRESH_MS = 6e4;
@@ -79,7 +110,7 @@ var MAX_CACHE_ERROR_LENGTH = 500;
 function record(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
-function number(value) {
+function number2(value) {
   const result = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   return Number.isFinite(result) ? result : void 0;
 }
@@ -99,14 +130,14 @@ function quotaWindow(value) {
   const source = record(value);
   const id = string(source.id);
   const label = string(source.label);
-  const used = number(source.used);
+  const used = number2(source.used);
   if (!id || !label || used === void 0) return void 0;
-  const reset = string(source.reset);
+  const resetAt = number2(source.resetAt);
   return {
     id,
     label,
     used: Math.min(100, Math.max(0, used)),
-    ...reset ? { reset } : {}
+    ...resetAt === void 0 ? {} : { resetAt }
   };
 }
 function quotaReport(value) {
@@ -127,9 +158,9 @@ function quotaReport(value) {
 }
 function providerRefresh(value) {
   const source = record(value);
-  const checkedAt = number(source.checkedAt);
-  const retryAt = number(source.retryAt);
-  const failures = Math.max(0, Math.floor(number(source.failures) ?? 0));
+  const checkedAt = number2(source.checkedAt);
+  const retryAt = number2(source.retryAt);
+  const failures = Math.max(0, Math.floor(number2(source.failures) ?? 0));
   if (checkedAt === void 0 && retryAt === void 0 && failures === 0) return void 0;
   return {
     ...checkedAt === void 0 ? {} : { checkedAt },
@@ -149,10 +180,10 @@ function providerRefreshState(value) {
 function quotaCache(value) {
   const source = record(value);
   const reports = Array.isArray(source.reports) ? source.reports.map(quotaReport).filter((item) => Boolean(item)) : [];
-  const updatedAt = number(source.updatedAt);
-  const checkedAt = number(source.checkedAt);
-  const retryAt = number(source.retryAt);
-  const failures = Math.max(0, Math.floor(number(source.failures) ?? 0));
+  const updatedAt = number2(source.updatedAt);
+  const checkedAt = number2(source.checkedAt);
+  const retryAt = number2(source.retryAt);
+  const failures = Math.max(0, Math.floor(number2(source.failures) ?? 0));
   const providerRefresh2 = providerRefreshState(source.providerRefresh);
   const error = cacheError(source.error);
   return {
@@ -348,7 +379,7 @@ var SharedQuotaStore = class {
     }
     const source = record(parsed);
     const owner = string(source.owner);
-    const ttlMs = number(source.ttlMs);
+    const ttlMs = number2(source.ttlMs);
     if (source.schemaVersion !== CACHE_SCHEMA_VERSION || !owner || !SAFE_TOKEN.test(owner) || this.markerName(owner) !== name || ttlMs === void 0 || ttlMs <= 0) {
       return void 0;
     }
@@ -657,7 +688,7 @@ var PLAN_KEYS = /* @__PURE__ */ new Set([
 function record2(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
-function number2(value) {
+function number3(value) {
   const result = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   return Number.isFinite(result) ? result : void 0;
 }
@@ -714,7 +745,7 @@ function mergeRefreshedReports(reports, previous, refreshedKinds) {
   ];
 }
 function clampPercent(value) {
-  const result = number2(value);
+  const result = number3(value);
   if (result === void 0) return void 0;
   return Math.min(100, Math.max(0, result));
 }
@@ -808,27 +839,6 @@ function chatGPTAccountID(file) {
   const metadata = record2(source.metadata);
   return findNestedString(decodeJWT(source.id_token), /* @__PURE__ */ new Set(["chatgpt_account_id", "chatgptaccountid"])) ?? findNestedString(decodeJWT(metadata.id_token), /* @__PURE__ */ new Set(["chatgpt_account_id", "chatgptaccountid"]));
 }
-function compactDate(timestamp) {
-  const date = new Date(timestamp);
-  if (!Number.isFinite(date.getTime())) return void 0;
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hour = String(date.getHours()).padStart(2, "0");
-  const minute = String(date.getMinutes()).padStart(2, "0");
-  return `${month}/${day} ${hour}:${minute}`;
-}
-function resetLabel(value, afterSeconds) {
-  const after = number2(afterSeconds);
-  let target;
-  if (after !== void 0) target = Date.now() + Math.max(0, after) * 1e3;
-  if (target === void 0 && typeof value === "number") target = value > 1e10 ? value : value * 1e3;
-  if (target === void 0 && typeof value === "string") {
-    const numeric = Number(value);
-    target = Number.isFinite(numeric) ? numeric > 1e10 ? numeric : numeric * 1e3 : Date.parse(value);
-  }
-  if (!target || !Number.isFinite(target)) return void 0;
-  return compactDate(target);
-}
 function quotaColor(api, used) {
   if (used > 80) return api.theme.current.error;
   if (used > 50) return api.theme.current.warning;
@@ -867,7 +877,7 @@ async function managementCall(input) {
     },
     input.timeoutMs
   );
-  const status = number2(envelope.status_code ?? envelope.statusCode) ?? 0;
+  const status = number3(envelope.status_code ?? envelope.statusCode) ?? 0;
   if (status < 200 || status >= 300) throw new Error(`upstream HTTP ${status || "error"}`);
   const raw = envelope.body;
   let body = raw;
@@ -889,13 +899,13 @@ function codexWindow(value, fallback) {
   const window = record2(value);
   const used = clampPercent(window.used_percent ?? window.usedPercent);
   if (used === void 0) return void 0;
-  const seconds = number2(window.limit_window_seconds ?? window.limitWindowSeconds);
+  const seconds = number3(window.limit_window_seconds ?? window.limitWindowSeconds);
   const label = seconds && seconds >= 5e5 ? "7d" : seconds && seconds >= 14e3 ? "5h" : fallback;
   return {
     id: label,
     label,
     used,
-    reset: resetLabel(window.reset_at ?? window.resetAt, window.reset_after_seconds ?? window.resetAfterSeconds)
+    resetAt: resetTimestamp(window.reset_at ?? window.resetAt, window.reset_after_seconds ?? window.resetAfterSeconds)
   };
 }
 async function fetchCodex(file, baseURL, key, timeoutMs) {
@@ -933,7 +943,7 @@ function claudeWindow(body, id, label) {
   const value = record2(body[id]);
   const used = clampPercent(value.utilization ?? value.percent);
   if (used === void 0) return void 0;
-  return { id, label, used, reset: resetLabel(value.resets_at ?? value.reset_at ?? value.resetsAt) };
+  return { id, label, used, resetAt: resetTimestamp(value.resets_at ?? value.reset_at ?? value.resetsAt) };
 }
 async function fetchClaude(file, baseURL, key, timeoutMs) {
   const index = authIndex(file);
@@ -1002,7 +1012,7 @@ async function fetchGrok(file, baseURL, key, timeoutMs) {
   const weeklyUsed = clampPercent(weeklyBody.creditUsagePercent ?? weeklyBody.credit_usage_percent);
   const period = record2(weeklyBody.currentPeriod ?? weeklyBody.current_period);
   if (weeklyUsed !== void 0) {
-    windows.push({ id: "weekly", label: "Week", used: weeklyUsed, reset: resetLabel(period.end) });
+    windows.push({ id: "weekly", label: "Week", used: weeklyUsed, resetAt: resetTimestamp(period.end) });
   }
   const products = Array.isArray(weeklyBody.productUsage ?? weeklyBody.product_usage) ? weeklyBody.productUsage ?? weeklyBody.product_usage : [];
   for (const raw of products.slice(0, 2)) {
@@ -1010,16 +1020,16 @@ async function fetchGrok(file, baseURL, key, timeoutMs) {
     const used = clampPercent(product.usagePercent ?? product.usage_percent);
     if (used === void 0) continue;
     const name = string2(product.product) ?? "Product";
-    windows.push({ id: `product-${name}`, label: name, used, reset: resetLabel(period.end) });
+    windows.push({ id: `product-${name}`, label: name, used, resetAt: resetTimestamp(period.end) });
   }
-  const limit = number2(record2(monthlyBody.monthlyLimit ?? monthlyBody.monthly_limit).val);
-  const usedCredits = number2(record2(monthlyBody.used).val);
+  const limit = number3(record2(monthlyBody.monthlyLimit ?? monthlyBody.monthly_limit).val);
+  const usedCredits = number3(record2(monthlyBody.used).val);
   if (limit && usedCredits !== void 0) {
     windows.push({
       id: "monthly",
       label: "Month",
       used: Math.min(100, Math.max(0, usedCredits / limit * 100)),
-      reset: resetLabel(monthlyBody.billingPeriodEnd ?? monthlyBody.billing_period_end)
+      resetAt: resetTimestamp(monthlyBody.billingPeriodEnd ?? monthlyBody.billing_period_end)
     });
   }
   if (!windows.length) throw new Error("quota windows unavailable");
@@ -1076,8 +1086,16 @@ function QuotaView(props) {
   const checked = createMemo(() => {
     const value = props.state.checkedAt ?? props.state.updatedAt;
     if (!value) return void 0;
-    return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return compactTime(value);
   });
+  const reportError = (report) => {
+    if (!report.error) return void 0;
+    const error = report.error.replace(/\s*·\s*retry\s+.*$/i, "");
+    const retryAt = props.state.providerRefresh?.[report.kind]?.retryAt;
+    if (!rateLimited(error) || retryAt === void 0) return error;
+    const retry = compactTime(retryAt);
+    return retry ? `${error} \xB7 retry ${retry}` : error;
+  };
   return /* @__PURE__ */ jsxs("box", { width: "100%", children: [
     /* @__PURE__ */ jsxs("box", { width: "100%", flexDirection: "row", justifyContent: "space-between", marginBottom: 1, children: [
       /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.text, children: /* @__PURE__ */ jsx("b", { children: "Quota" }) }),
@@ -1112,16 +1130,17 @@ function QuotaView(props) {
         /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.text, children: /* @__PURE__ */ jsx("b", { children: providerTitle(report.kind) }) }),
         /* @__PURE__ */ jsx(Show, { when: report.plan, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: report.plan }) })
       ] }),
-      /* @__PURE__ */ jsx(Show, { when: report.error, children: /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: report.error }) }),
+      /* @__PURE__ */ jsx(Show, { when: reportError(report), children: (error) => /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.warning, children: error() }) }),
       /* @__PURE__ */ jsx(For, { each: report.windows, children: (window) => {
         const color = () => quotaColor(props.api, window.used);
+        const reset = () => window.resetAt === void 0 ? void 0 : compactDate(window.resetAt);
         return /* @__PURE__ */ jsxs("box", { width: "100%", height: 1, flexDirection: "row", justifyContent: "space-between", children: [
           /* @__PURE__ */ jsx("text", { fg: props.api.theme.current.textMuted, children: window.label }),
           /* @__PURE__ */ jsxs("box", { flexDirection: "row", children: [
             /* @__PURE__ */ jsx("text", { fg: color(), children: /* @__PURE__ */ jsx("b", { children: percentLabel(window.used) }) }),
-            /* @__PURE__ */ jsx(Show, { when: window.reset, children: /* @__PURE__ */ jsxs("text", { fg: props.api.theme.current.textMuted, children: [
+            /* @__PURE__ */ jsx(Show, { when: reset(), children: (label) => /* @__PURE__ */ jsxs("text", { fg: props.api.theme.current.textMuted, children: [
               " | ",
-              window.reset
+              label()
             ] }) })
           ] })
         ] });
@@ -1135,9 +1154,9 @@ var tui = async (api, rawOptions) => {
   const options = rawOptions ?? {};
   const rawBaseURL = string2(options.baseURL);
   const baseURL = rawBaseURL ? normalizeBaseURL(rawBaseURL) : void 0;
-  const refreshMs = clampRefreshMs(number2(options.refreshMs) ?? DEFAULT_REFRESH_MS);
-  const timeoutMs = Math.max(5e3, number2(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS);
-  const backoffMs = Math.max(6e4, number2(options.backoffMs) ?? DEFAULT_BACKOFF_MS);
+  const refreshMs = clampRefreshMs(number3(options.refreshMs) ?? DEFAULT_REFRESH_MS);
+  const timeoutMs = Math.max(5e3, number3(options.timeoutMs) ?? DEFAULT_TIMEOUT_MS);
+  const backoffMs = Math.max(6e4, number3(options.backoffMs) ?? DEFAULT_BACKOFF_MS);
   const leaseMs = timeoutMs * 2 + 15e3;
   const automaticPolling = shouldPollAutomatically(autoMode, options.pollInAutoMode === true);
   const key = string2(options.managementKey);
@@ -1177,6 +1196,7 @@ var tui = async (api, rawOptions) => {
       reports: cache.reports,
       updatedAt: cache.updatedAt,
       checkedAt: cacheVersion(cache),
+      providerRefresh: cache.providerRefresh,
       error
     };
   };
@@ -1227,7 +1247,7 @@ var tui = async (api, rawOptions) => {
     }
     return latestCache;
   };
-  const retryLabel = (timestamp) => new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const retryLabel = (timestamp) => compactTime(timestamp) ?? "later";
   const backoffDelay = (failures) => Math.min(MAX_BACKOFF_MS, backoffMs * 2 ** Math.min(8, Math.max(0, failures - 1)));
   const refreshTargets = (cache, now, force) => {
     const providerRefresh2 = providerRefreshState2(cache);
@@ -1507,10 +1527,7 @@ var tui = async (api, rawOptions) => {
               failures
             };
           }
-          const displayFetched = fetched.map(
-            (report) => rateLimited(report.error) && providerRefresh2[report.kind]?.retryAt ? { ...report, error: `Rate limited \xB7 retry ${retryLabel(providerRefresh2[report.kind].retryAt)}` } : report
-          );
-          const reports = mergeRefreshedReports(displayFetched, cache.reports, refreshedKinds);
+          const reports = mergeRefreshedReports(fetched, cache.reports, refreshedKinds);
           const updatedAt = fetched.some((report) => !report.error) ? checkedAt : cache.updatedAt ?? checkedAt;
           nextCache = quotaCache({ reports, updatedAt, checkedAt, failures: 0, providerRefresh: providerRefresh2 });
           nextState = stateFromCache(nextCache);

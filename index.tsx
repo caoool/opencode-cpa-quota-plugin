@@ -4,6 +4,7 @@
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createMemo, createSignal, For, Show } from "solid-js"
+import { compactDate, compactTime, resetTimestamp } from "./quota-time"
 import {
   clampRefreshMs,
   dueProviderRefreshes,
@@ -35,6 +36,7 @@ type QuotaState = {
   reports: QuotaReport[]
   updatedAt?: number
   checkedAt?: number
+  providerRefresh?: ProviderRefreshState
   error?: string
 }
 
@@ -268,33 +270,6 @@ function chatGPTAccountID(file: AuthFile) {
   )
 }
 
-function compactDate(timestamp: number) {
-  const date = new Date(timestamp)
-  if (!Number.isFinite(date.getTime())) return undefined
-  const month = String(date.getMonth() + 1).padStart(2, "0")
-  const day = String(date.getDate()).padStart(2, "0")
-  const hour = String(date.getHours()).padStart(2, "0")
-  const minute = String(date.getMinutes()).padStart(2, "0")
-  return `${month}/${day} ${hour}:${minute}`
-}
-
-function resetLabel(value: unknown, afterSeconds?: unknown) {
-  const after = number(afterSeconds)
-  let target: number | undefined
-  if (after !== undefined) target = Date.now() + Math.max(0, after) * 1_000
-  if (target === undefined && typeof value === "number") target = value > 10_000_000_000 ? value : value * 1_000
-  if (target === undefined && typeof value === "string") {
-    const numeric = Number(value)
-    target = Number.isFinite(numeric)
-      ? numeric > 10_000_000_000
-        ? numeric
-        : numeric * 1_000
-      : Date.parse(value)
-  }
-  if (!target || !Number.isFinite(target)) return undefined
-  return compactDate(target)
-}
-
 function quotaColor(api: TuiPluginApi, used: number) {
   if (used > 80) return api.theme.current.error
   if (used > 50) return api.theme.current.warning
@@ -375,7 +350,7 @@ function codexWindow(value: unknown, fallback: string): QuotaWindow | undefined 
     id: label,
     label,
     used,
-    reset: resetLabel(window.reset_at ?? window.resetAt, window.reset_after_seconds ?? window.resetAfterSeconds),
+    resetAt: resetTimestamp(window.reset_at ?? window.resetAt, window.reset_after_seconds ?? window.resetAfterSeconds),
   }
 }
 
@@ -415,7 +390,7 @@ function claudeWindow(body: Record<string, unknown>, id: string, label: string):
   const value = record(body[id])
   const used = clampPercent(value.utilization ?? value.percent)
   if (used === undefined) return undefined
-  return { id, label, used, reset: resetLabel(value.resets_at ?? value.reset_at ?? value.resetsAt) }
+  return { id, label, used, resetAt: resetTimestamp(value.resets_at ?? value.reset_at ?? value.resetsAt) }
 }
 
 async function fetchClaude(file: AuthFile, baseURL: string, key: string, timeoutMs: number): Promise<QuotaReport> {
@@ -486,7 +461,7 @@ async function fetchGrok(file: AuthFile, baseURL: string, key: string, timeoutMs
   const weeklyUsed = clampPercent(weeklyBody.creditUsagePercent ?? weeklyBody.credit_usage_percent)
   const period = record(weeklyBody.currentPeriod ?? weeklyBody.current_period)
   if (weeklyUsed !== undefined) {
-    windows.push({ id: "weekly", label: "Week", used: weeklyUsed, reset: resetLabel(period.end) })
+    windows.push({ id: "weekly", label: "Week", used: weeklyUsed, resetAt: resetTimestamp(period.end) })
   }
   const products = Array.isArray(weeklyBody.productUsage ?? weeklyBody.product_usage)
     ? ((weeklyBody.productUsage ?? weeklyBody.product_usage) as unknown[])
@@ -496,7 +471,7 @@ async function fetchGrok(file: AuthFile, baseURL: string, key: string, timeoutMs
     const used = clampPercent(product.usagePercent ?? product.usage_percent)
     if (used === undefined) continue
     const name = string(product.product) ?? "Product"
-    windows.push({ id: `product-${name}`, label: name, used, reset: resetLabel(period.end) })
+    windows.push({ id: `product-${name}`, label: name, used, resetAt: resetTimestamp(period.end) })
   }
   const limit = number(record(monthlyBody.monthlyLimit ?? monthlyBody.monthly_limit).val)
   const usedCredits = number(record(monthlyBody.used).val)
@@ -505,7 +480,7 @@ async function fetchGrok(file: AuthFile, baseURL: string, key: string, timeoutMs
       id: "monthly",
       label: "Month",
       used: Math.min(100, Math.max(0, (usedCredits / limit) * 100)),
-      reset: resetLabel(monthlyBody.billingPeriodEnd ?? monthlyBody.billing_period_end),
+      resetAt: resetTimestamp(monthlyBody.billingPeriodEnd ?? monthlyBody.billing_period_end),
     })
   }
   if (!windows.length) throw new Error("quota windows unavailable")
@@ -574,8 +549,16 @@ function QuotaView(props: {
   const checked = createMemo(() => {
     const value = props.state.checkedAt ?? props.state.updatedAt
     if (!value) return undefined
-    return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    return compactTime(value)
   })
+  const reportError = (report: QuotaReport) => {
+    if (!report.error) return undefined
+    const error = report.error.replace(/\s*·\s*retry\s+.*$/i, "")
+    const retryAt = props.state.providerRefresh?.[report.kind]?.retryAt
+    if (!rateLimited(error) || retryAt === undefined) return error
+    const retry = compactTime(retryAt)
+    return retry ? `${error} · retry ${retry}` : error
+  }
 
   return (
     <box width="100%">
@@ -634,12 +617,13 @@ function QuotaView(props: {
                   <text fg={props.api.theme.current.textMuted}>{report.plan}</text>
                 </Show>
               </box>
-              <Show when={report.error}>
-                <text fg={props.api.theme.current.warning}>{report.error}</text>
+              <Show when={reportError(report)}>
+                {(error) => <text fg={props.api.theme.current.warning}>{error()}</text>}
               </Show>
               <For each={report.windows}>
                 {(window) => {
                   const color = () => quotaColor(props.api, window.used)
+                  const reset = () => (window.resetAt === undefined ? undefined : compactDate(window.resetAt))
                   return (
                     <box width="100%" height={1} flexDirection="row" justifyContent="space-between">
                       <text fg={props.api.theme.current.textMuted}>{window.label}</text>
@@ -647,8 +631,8 @@ function QuotaView(props: {
                         <text fg={color()}>
                           <b>{percentLabel(window.used)}</b>
                         </text>
-                        <Show when={window.reset}>
-                          <text fg={props.api.theme.current.textMuted}> | {window.reset}</text>
+                        <Show when={reset()}>
+                          {(label) => <text fg={props.api.theme.current.textMuted}> | {label()}</text>}
                         </Show>
                       </box>
                     </box>
@@ -725,6 +709,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       reports: cache.reports,
       updatedAt: cache.updatedAt,
       checkedAt: cacheVersion(cache),
+      providerRefresh: cache.providerRefresh,
       error,
     }
   }
@@ -783,8 +768,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     return latestCache
   }
 
-  const retryLabel = (timestamp: number) =>
-    new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  const retryLabel = (timestamp: number) => compactTime(timestamp) ?? "later"
 
   const backoffDelay = (failures: number) =>
     Math.min(MAX_BACKOFF_MS, backoffMs * 2 ** Math.min(8, Math.max(0, failures - 1)))
@@ -1102,12 +1086,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
               failures,
             }
           }
-          const displayFetched = fetched.map((report) =>
-            rateLimited(report.error) && providerRefresh[report.kind]?.retryAt
-              ? { ...report, error: `Rate limited · retry ${retryLabel(providerRefresh[report.kind]!.retryAt!)}` }
-              : report,
-          )
-          const reports = mergeRefreshedReports(displayFetched, cache.reports, refreshedKinds)
+          const reports = mergeRefreshedReports(fetched, cache.reports, refreshedKinds)
           const updatedAt = fetched.some((report) => !report.error) ? checkedAt : (cache.updatedAt ?? checkedAt)
           nextCache = quotaCache({ reports, updatedAt, checkedAt, failures: 0, providerRefresh })
           nextState = stateFromCache(nextCache)
