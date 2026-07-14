@@ -1,6 +1,11 @@
 export const TIMER_SLACK_MS = 250
 export const MIN_REFRESH_MS = 60_000
 
+export type ProviderRefreshWindow = {
+  checkedAt?: number
+  retryAt?: number
+}
+
 export function clampRefreshMs(value: number) {
   return Math.max(MIN_REFRESH_MS, value)
 }
@@ -40,6 +45,48 @@ export function nextRefreshDelay(checkedAt: number, refreshMs: number, now: numb
     refreshMs + TIMER_SLACK_MS,
     Math.max(TIMER_SLACK_MS, checkedAt + refreshMs + TIMER_SLACK_MS - now),
   )
+}
+
+export function dueProviderRefreshes<Kind extends string>(input: {
+  kinds: readonly Kind[]
+  refresh: Partial<Record<Kind, ProviderRefreshWindow>>
+  refreshMs: number
+  now: number
+  force?: boolean
+}) {
+  return input.kinds.filter((kind) => {
+    const refresh = input.refresh[kind]
+    if (refresh?.retryAt !== undefined) return refresh.retryAt <= input.now
+    if (input.force) return true
+    return refresh?.checkedAt === undefined || input.now - refresh.checkedAt >= input.refreshMs
+  })
+}
+
+export function nextProviderRefreshDelay<Kind extends string>(input: {
+  kinds: readonly Kind[]
+  refresh: Partial<Record<Kind, ProviderRefreshWindow>>
+  refreshMs: number
+  now: number
+}) {
+  if (!input.kinds.length) return TIMER_SLACK_MS
+  return Math.min(
+    ...input.kinds.map((kind) => {
+      const refresh = input.refresh[kind]
+      if (refresh?.retryAt !== undefined) {
+        return Math.max(TIMER_SLACK_MS, refresh.retryAt - input.now + TIMER_SLACK_MS)
+      }
+      if (refresh?.checkedAt === undefined) return TIMER_SLACK_MS
+      return Math.min(
+        input.refreshMs + TIMER_SLACK_MS,
+        Math.max(TIMER_SLACK_MS, refresh.checkedAt + input.refreshMs + TIMER_SLACK_MS - input.now),
+      )
+    }),
+  )
+}
+
+export function latestRefreshAt(values: readonly (number | undefined)[]) {
+  const timestamps = values.filter((value): value is number => value !== undefined && Number.isFinite(value))
+  return timestamps.length ? Math.max(...timestamps) : undefined
 }
 
 export function shouldAdoptCache(input: {

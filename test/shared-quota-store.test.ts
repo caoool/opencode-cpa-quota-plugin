@@ -80,6 +80,28 @@ test("roundtrips a normalized shared top-level error", async (t) => {
   assert.equal(await lease.release(), true)
 })
 
+test("roundtrips independent provider refresh and backoff state", async (t) => {
+  const stateDir = await temporaryDirectory(t)
+  const now = 1_800_000_000_000
+  const store = createSharedQuotaStore({ stateDir, now: () => now, token: () => "provider-refresh" })
+  const lease = await store.acquireLease(10_000)
+  assert.ok(lease)
+  const expected: QuotaCache = {
+    ...cache(now),
+    providerRefresh: {
+      codex: { checkedAt: now, failures: 0 },
+      claude: { checkedAt: now - 1_000, retryAt: now + 300_000, failures: 2 },
+      grok: { checkedAt: now - 500, failures: 0 },
+    },
+  }
+
+  await store.write(expected, lease)
+  assert.deepEqual(await store.read(), expected)
+  const raw = JSON.parse(await readFile(store.paths.cache, "utf8")) as Record<string, unknown>
+  assert.deepEqual(raw.providerRefresh, expected.providerRefresh)
+  assert.equal(await lease.release(), true)
+})
+
 test("repairs corrupt JSON only while holding the shared lease", async (t) => {
   const stateDir = await temporaryDirectory(t)
   const now = 1_800_000_000_000
@@ -269,4 +291,20 @@ test("strict cache normalization drops invalid reports and legacy lease fields",
   assert.equal(normalized.error?.length, MAX_CACHE_ERROR_LENGTH)
   const { error: _error, ...withoutError } = normalized
   assert.deepEqual(withoutError, { reports: [report], failures: 0 })
+})
+
+test("strict cache normalization keeps only known provider refresh entries", () => {
+  const normalized = quotaCache({
+    reports: [report],
+    failures: 0,
+    providerRefresh: {
+      claude: { checkedAt: "2000", retryAt: 3000, failures: "2" },
+      unknown: { checkedAt: 9999, failures: 10 },
+      codex: { failures: -1 },
+    },
+  })
+
+  assert.deepEqual(normalized.providerRefresh, {
+    claude: { checkedAt: 2000, retryAt: 3000, failures: 2 },
+  })
 })

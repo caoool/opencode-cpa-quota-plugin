@@ -29,6 +29,34 @@ function nextRefreshDelay(checkedAt, refreshMs, now) {
     Math.max(TIMER_SLACK_MS, checkedAt + refreshMs + TIMER_SLACK_MS - now)
   );
 }
+function dueProviderRefreshes(input) {
+  return input.kinds.filter((kind) => {
+    const refresh = input.refresh[kind];
+    if (refresh?.retryAt !== void 0) return refresh.retryAt <= input.now;
+    if (input.force) return true;
+    return refresh?.checkedAt === void 0 || input.now - refresh.checkedAt >= input.refreshMs;
+  });
+}
+function nextProviderRefreshDelay(input) {
+  if (!input.kinds.length) return TIMER_SLACK_MS;
+  return Math.min(
+    ...input.kinds.map((kind) => {
+      const refresh = input.refresh[kind];
+      if (refresh?.retryAt !== void 0) {
+        return Math.max(TIMER_SLACK_MS, refresh.retryAt - input.now + TIMER_SLACK_MS);
+      }
+      if (refresh?.checkedAt === void 0) return TIMER_SLACK_MS;
+      return Math.min(
+        input.refreshMs + TIMER_SLACK_MS,
+        Math.max(TIMER_SLACK_MS, refresh.checkedAt + input.refreshMs + TIMER_SLACK_MS - input.now)
+      );
+    })
+  );
+}
+function latestRefreshAt(values) {
+  const timestamps = values.filter((value) => value !== void 0 && Number.isFinite(value));
+  return timestamps.length ? Math.max(...timestamps) : void 0;
+}
 function shouldAdoptCache(input) {
   if (!input.cacheHasReports) return false;
   if (!input.currentHasReports) return true;
@@ -97,6 +125,27 @@ function quotaReport(value) {
     ...error ? { error } : {}
   };
 }
+function providerRefresh(value) {
+  const source = record(value);
+  const checkedAt = number(source.checkedAt);
+  const retryAt = number(source.retryAt);
+  const failures = Math.max(0, Math.floor(number(source.failures) ?? 0));
+  if (checkedAt === void 0 && retryAt === void 0 && failures === 0) return void 0;
+  return {
+    ...checkedAt === void 0 ? {} : { checkedAt },
+    ...retryAt === void 0 ? {} : { retryAt },
+    failures
+  };
+}
+function providerRefreshState(value) {
+  const source = record(value);
+  const result = {};
+  for (const kind of ["codex", "claude", "grok"]) {
+    const refresh = providerRefresh(source[kind]);
+    if (refresh) result[kind] = refresh;
+  }
+  return Object.keys(result).length ? result : void 0;
+}
 function quotaCache(value) {
   const source = record(value);
   const reports = Array.isArray(source.reports) ? source.reports.map(quotaReport).filter((item) => Boolean(item)) : [];
@@ -104,6 +153,7 @@ function quotaCache(value) {
   const checkedAt = number(source.checkedAt);
   const retryAt = number(source.retryAt);
   const failures = Math.max(0, Math.floor(number(source.failures) ?? 0));
+  const providerRefresh2 = providerRefreshState(source.providerRefresh);
   const error = cacheError(source.error);
   return {
     reports,
@@ -111,6 +161,7 @@ function quotaCache(value) {
     ...checkedAt === void 0 ? {} : { checkedAt },
     ...retryAt === void 0 ? {} : { retryAt },
     failures,
+    ...providerRefresh2 ? { providerRefresh: providerRefresh2 } : {},
     ...error ? { error } : {}
   };
 }
@@ -123,6 +174,7 @@ function diskCache(value) {
     ...cache.checkedAt === void 0 ? {} : { checkedAt: cache.checkedAt },
     ...cache.retryAt === void 0 ? {} : { retryAt: cache.retryAt },
     failures: cache.failures,
+    ...cache.providerRefresh ? { providerRefresh: cache.providerRefresh } : {},
     ...cache.error ? { error: cache.error } : {}
   };
 }
@@ -269,6 +321,7 @@ var SharedQuotaStore = class {
       checkedAt: source.checkedAt,
       retryAt: source.retryAt,
       failures: source.failures,
+      providerRefresh: source.providerRefresh,
       error: source.error
     });
   }
@@ -579,6 +632,7 @@ var LEGACY_CACHE_KEY = "cpa-quota-sidebar.cache.v2";
 var SHARED_SYNC_MS = 5e3;
 var STORAGE_RETRY_MS = 5e3;
 var LOCK_RETRY_MS = 1e3;
+var PROVIDER_KINDS = ["codex", "claude", "grok"];
 var PROVIDER_ORDER = { codex: 0, claude: 1, grok: 2 };
 var PLAN_KEYS = /* @__PURE__ */ new Set([
   "plan",
@@ -613,6 +667,33 @@ function string2(value) {
 function rateLimited(value) {
   return Boolean(value && /(?:429|rate[ -]?limit)/i.test(value));
 }
+function providerRefreshState2(cache) {
+  const result = {};
+  for (const kind of PROVIDER_KINDS) {
+    const current = cache.providerRefresh?.[kind];
+    if (current) {
+      result[kind] = { ...current };
+      continue;
+    }
+    const reports = cache.reports.filter((report) => report.kind === kind);
+    if (!reports.length) continue;
+    const limited = reports.some((report) => rateLimited(report.error));
+    const checkedAt = cache.checkedAt ?? cache.updatedAt;
+    result[kind] = {
+      ...checkedAt === void 0 ? {} : { checkedAt },
+      ...limited && cache.retryAt !== void 0 ? { retryAt: cache.retryAt } : {},
+      failures: limited ? cache.failures : 0
+    };
+  }
+  return result;
+}
+function trackedProviderKinds(cache, refresh = providerRefreshState2(cache)) {
+  const kinds = new Set(cache.reports.map((report) => report.kind));
+  for (const kind of PROVIDER_KINDS) {
+    if (refresh[kind]) kinds.add(kind);
+  }
+  return PROVIDER_KINDS.filter((kind) => kinds.has(kind));
+}
 function cachedReport(report, previous) {
   const exact = previous.find((item) => item.kind === report.kind && item.account === report.account);
   if (exact?.windows.length) return exact;
@@ -625,6 +706,12 @@ function mergeReports(reports, previous) {
     const cached = cachedReport(report, previous);
     return cached ? { ...cached, plan: report.plan ?? cached.plan, error: report.error } : report;
   });
+}
+function mergeRefreshedReports(reports, previous, refreshedKinds) {
+  return [
+    ...previous.filter((report) => !refreshedKinds.has(report.kind)),
+    ...mergeReports(reports, previous)
+  ];
 }
 function clampPercent(value) {
   const result = number2(value);
@@ -949,7 +1036,7 @@ async function fetchGrok(file, baseURL, key, timeoutMs) {
     windows
   };
 }
-async function fetchReports(baseURL, key, timeoutMs) {
+async function fetchReports(baseURL, key, timeoutMs, kinds) {
   const auth = await requestJSON(
     `${baseURL}/v0/management/auth-files`,
     { headers: { Authorization: `Bearer ${key}` } },
@@ -958,8 +1045,9 @@ async function fetchReports(baseURL, key, timeoutMs) {
   const files = Array.isArray(auth.files) ? auth.files : [];
   const supported = files.map((file) => ({ file, kind: providerKind2(file) })).filter((item) => item.kind);
   if (!supported.length) throw new Error("no supported CPA auth files");
-  return Promise.all(
-    supported.map(async ({ file, kind }) => {
+  const selected = kinds ? supported.filter(({ kind }) => kind && kinds.has(kind)) : supported;
+  const reports = await Promise.all(
+    selected.map(async ({ file, kind }) => {
       try {
         if (kind === "codex") return await fetchCodex(file, baseURL, key, timeoutMs);
         if (kind === "claude") return await fetchClaude(file, baseURL, key, timeoutMs);
@@ -974,6 +1062,10 @@ async function fetchReports(baseURL, key, timeoutMs) {
       }
     })
   );
+  return {
+    reports,
+    supportedKinds: new Set(supported.map(({ kind }) => kind))
+  };
 }
 function QuotaView(props) {
   const reports = createMemo(
@@ -1065,7 +1157,10 @@ var tui = async (api, rawOptions) => {
     migrationPending = !(error instanceof InvalidSharedQuotaCacheError);
   }
   const configuredStatus = () => !baseURL ? "missing-base-url" : !key ? "missing-key" : "ready";
-  const cacheVersion = (cache) => cache.checkedAt ?? cache.updatedAt;
+  const cacheVersion = (cache) => {
+    const providerChecks = Object.values(cache.providerRefresh ?? {}).map((refresh2) => refresh2?.checkedAt);
+    return latestRefreshAt([cache.updatedAt, cache.checkedAt, ...providerChecks]);
+  };
   const stateFromCache = (cache, options2 = {}) => {
     const error = options2.error ?? cache.error;
     const configured = configuredStatus();
@@ -1081,7 +1176,7 @@ var tui = async (api, rawOptions) => {
       status,
       reports: cache.reports,
       updatedAt: cache.updatedAt,
-      checkedAt: cache.checkedAt,
+      checkedAt: cacheVersion(cache),
       error
     };
   };
@@ -1122,6 +1217,7 @@ var tui = async (api, rawOptions) => {
         checkedAt: cache.checkedAt ?? current.checkedAt,
         retryAt: cache.retryAt,
         failures: cache.failures,
+        providerRefresh: cache.providerRefresh ?? latestCache.providerRefresh,
         error: cache.error
       });
     }
@@ -1133,9 +1229,45 @@ var tui = async (api, rawOptions) => {
   };
   const retryLabel = (timestamp) => new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const backoffDelay = (failures) => Math.min(MAX_BACKOFF_MS, backoffMs * 2 ** Math.min(8, Math.max(0, failures - 1)));
+  const refreshTargets = (cache, now, force) => {
+    const providerRefresh2 = providerRefreshState2(cache);
+    const kinds = trackedProviderKinds(cache, providerRefresh2);
+    if (!kinds.length) return void 0;
+    return new Set(
+      dueProviderRefreshes({
+        kinds,
+        refresh: providerRefresh2,
+        refreshMs,
+        now,
+        force
+      })
+    );
+  };
+  const targetsAdvanced = (before, after, targets) => {
+    if (!targets) {
+      return (cacheVersion(after) ?? Number.NEGATIVE_INFINITY) > (cacheVersion(before) ?? Number.NEGATIVE_INFINITY);
+    }
+    if (targets.size === 0) return false;
+    const beforeRefresh = providerRefreshState2(before);
+    const afterRefresh = providerRefreshState2(after);
+    return [...targets].every(
+      (kind) => (afterRefresh[kind]?.checkedAt ?? Number.NEGATIVE_INFINITY) > (beforeRefresh[kind]?.checkedAt ?? Number.NEGATIVE_INFINITY)
+    );
+  };
   const scheduleFromCache = (cache, now = Date.now()) => {
     if (!automaticPolling) {
       scheduleRefresh(SHARED_SYNC_MS);
+      return;
+    }
+    const providerRefresh2 = providerRefreshState2(cache);
+    const kinds = trackedProviderKinds(cache, providerRefresh2);
+    if (kinds.length) {
+      scheduleRefresh(
+        Math.min(
+          SHARED_SYNC_MS,
+          nextProviderRefreshDelay({ kinds, refresh: providerRefresh2, refreshMs, now })
+        )
+      );
       return;
     }
     if (cache.retryAt && cache.retryAt > now) {
@@ -1166,11 +1298,14 @@ var tui = async (api, rawOptions) => {
     storageErrorActive = false;
     setState(stateFromCache(latestCache, { loadingWhenEmpty: true }));
   };
-  const showRetryToast = (retryAt) => {
+  const showRetryToast = (cache, now = Date.now()) => {
+    const providerRefresh2 = providerRefreshState2(cache);
+    const retries = trackedProviderKinds(cache, providerRefresh2).map((kind) => ({ kind, retryAt: providerRefresh2[kind]?.retryAt })).filter((item) => Boolean(item.retryAt && item.retryAt > now));
+    const message2 = retries.length ? retries.map(({ kind, retryAt }) => `${providerTitle(kind)} ${retryLabel(retryAt)}`).join(" \xB7 ") : cache.retryAt && cache.retryAt > now ? retryLabel(cache.retryAt) : "later";
     api.ui.toast({
       variant: "warning",
       title: "CPA quota",
-      message: `Rate limited; retry after ${retryLabel(retryAt)}`
+      message: `Rate limited; retry ${message2}`
     });
   };
   const adoptAfterLeaseLoss = async (notify) => {
@@ -1210,8 +1345,9 @@ var tui = async (api, rawOptions) => {
       }
       const allowUpstream = notify || automaticPolling;
       const needsCoordination = storageProbeRequired || migrationPending || sharedMissing;
-      const beforeLockVersion = cacheVersion(cache);
+      const beforeLockCache = cache;
       const now = Date.now();
+      const beforeTargets = refreshTargets(cache, now, notify);
       if (!needsCoordination) {
         if (!baseURL || !key) {
           setState((previous) => ({ ...previous, status: configuredStatus() }));
@@ -1222,15 +1358,19 @@ var tui = async (api, rawOptions) => {
           scheduleRefresh(SHARED_SYNC_MS);
           return;
         }
-        if (cache.retryAt && cache.retryAt > now) {
+        if (!beforeTargets && cache.retryAt && cache.retryAt > now) {
           scheduleFromCache(cache, now);
-          if (notify) showRetryToast(cache.retryAt);
+          if (notify) showRetryToast(cache, now);
           return;
         }
-        const retryDue = cache.retryAt !== void 0 && cache.retryAt <= now;
         const lastCheck = cacheVersion(cache);
-        if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
+        if (!beforeTargets && !notify && lastCheck && now - lastCheck < refreshMs) {
           scheduleFromCache(cache, now);
+          return;
+        }
+        if (beforeTargets?.size === 0) {
+          scheduleFromCache(cache, now);
+          if (notify) showRetryToast(cache, now);
           return;
         }
       }
@@ -1313,14 +1453,23 @@ var tui = async (api, rawOptions) => {
           return;
         }
         const lockedNow = Date.now();
-        if (cache.retryAt && cache.retryAt > lockedNow) {
+        const lockedTargets = refreshTargets(cache, lockedNow, notify);
+        if (!lockedTargets && cache.retryAt && cache.retryAt > lockedNow) {
           scheduleFromCache(cache, lockedNow);
-          if (notify) showRetryToast(cache.retryAt);
+          if (notify) showRetryToast(cache, lockedNow);
           return;
         }
-        const retryDue = cache.retryAt !== void 0 && cache.retryAt <= lockedNow;
         const lockedVersion = cacheVersion(cache);
-        if (notify && lockedVersion !== void 0 && lockedVersion > (beforeLockVersion ?? Number.NEGATIVE_INFINITY)) {
+        if (!lockedTargets && !notify && lockedVersion && lockedNow - lockedVersion < refreshMs) {
+          scheduleFromCache(cache, lockedNow);
+          return;
+        }
+        if (lockedTargets?.size === 0) {
+          scheduleFromCache(cache, lockedNow);
+          if (notify) showRetryToast(cache, lockedNow);
+          return;
+        }
+        if (notify && targetsAdvanced(beforeLockCache, cache, beforeTargets)) {
           scheduleFromCache(cache, lockedNow);
           api.ui.toast({
             variant: "success",
@@ -1329,60 +1478,89 @@ var tui = async (api, rawOptions) => {
           });
           return;
         }
-        if (!notify && !retryDue && lockedVersion && lockedNow - lockedVersion < refreshMs) {
-          scheduleFromCache(cache, lockedNow);
-          return;
-        }
         setRefreshing(true);
         didSetRefreshing = true;
         let nextCache;
         let nextState;
         let toast;
         try {
-          const fetched = (await fetchReports(baseURL, key, timeoutMs)).map((report) => ({
+          const fetchedResult = await fetchReports(baseURL, key, timeoutMs, lockedTargets);
+          const fetched = fetchedResult.reports.map((report) => ({
             ...report,
             plan: displayPlan(report.kind, report.plan, planLabels[report.kind])
           }));
           if (api.lifecycle.signal.aborted) return;
-          const limited = fetched.filter((report) => rateLimited(report.error));
-          const failures = limited.length ? cache.failures + 1 : 0;
-          const retryAt = limited.length ? Date.now() + backoffDelay(failures) : void 0;
-          const displayFetched = fetched.map(
-            (report) => rateLimited(report.error) && retryAt ? { ...report, error: `Rate limited \xB7 retry ${retryLabel(retryAt)}` } : report
-          );
-          const reports = mergeReports(displayFetched, cache.reports);
-          const complete = fetched.every((report) => !report.error);
           const checkedAt = Date.now();
-          const updatedAt = complete ? checkedAt : cache.updatedAt ?? checkedAt;
-          nextCache = quotaCache({ reports, updatedAt, checkedAt, retryAt, failures });
+          const refreshedKinds = lockedTargets ?? new Set(PROVIDER_KINDS);
+          const providerRefresh2 = providerRefreshState2(cache);
+          for (const kind of refreshedKinds) {
+            if (!fetchedResult.supportedKinds.has(kind)) {
+              delete providerRefresh2[kind];
+              continue;
+            }
+            const providerReports = fetched.filter((report) => report.kind === kind);
+            const limited = providerReports.some((report) => rateLimited(report.error));
+            const failures = limited ? (providerRefresh2[kind]?.failures ?? 0) + 1 : 0;
+            providerRefresh2[kind] = {
+              checkedAt,
+              ...limited ? { retryAt: checkedAt + backoffDelay(failures) } : {},
+              failures
+            };
+          }
+          const displayFetched = fetched.map(
+            (report) => rateLimited(report.error) && providerRefresh2[report.kind]?.retryAt ? { ...report, error: `Rate limited \xB7 retry ${retryLabel(providerRefresh2[report.kind].retryAt)}` } : report
+          );
+          const reports = mergeRefreshedReports(displayFetched, cache.reports, refreshedKinds);
+          const updatedAt = fetched.some((report) => !report.error) ? checkedAt : cache.updatedAt ?? checkedAt;
+          nextCache = quotaCache({ reports, updatedAt, checkedAt, failures: 0, providerRefresh: providerRefresh2 });
           nextState = stateFromCache(nextCache);
           if (notify) {
-            const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)));
+            const limitedKinds = PROVIDER_KINDS.filter(
+              (kind) => fetched.some((report) => report.kind === kind && rateLimited(report.error))
+            );
+            const refreshed = PROVIDER_KINDS.filter(
+              (kind) => fetched.some((report) => report.kind === kind && !report.error)
+            );
+            const cached = fetched.filter((report) => rateLimited(report.error)).every((report) => Boolean(cachedReport(report, cache.reports)));
             toast = {
-              variant: limited.length ? "warning" : "success",
-              message: limited.length ? `${limited.map((report) => providerTitle(report.kind)).join(", ")} rate limited; ${cached ? "showing cached usage" : `retry after ${retryLabel(retryAt)}`}` : "Usage refreshed"
+              variant: limitedKinds.length ? "warning" : "success",
+              message: limitedKinds.length ? `${limitedKinds.map(providerTitle).join(", ")} rate limited; ${refreshed.length ? `${refreshed.map(providerTitle).join(", ")} refreshed` : cached ? "showing cached usage" : "retry scheduled"}` : "Usage refreshed"
             };
           }
         } catch (error) {
           if (api.lifecycle.signal.aborted) return;
           const message2 = error instanceof Error ? error.message : "Quota refresh failed";
           const limited = rateLimited(message2);
-          const failures = limited ? cache.failures + 1 : cache.failures;
-          const retryAt = limited ? Date.now() + backoffDelay(failures) : void 0;
           const checkedAt = Date.now();
+          const providerRefresh2 = providerRefreshState2(cache);
+          const attemptedKinds = lockedTargets ? [...lockedTargets] : trackedProviderKinds(cache, providerRefresh2);
+          for (const kind of attemptedKinds) {
+            const failures2 = limited ? (providerRefresh2[kind]?.failures ?? 0) + 1 : 0;
+            providerRefresh2[kind] = {
+              checkedAt,
+              ...limited ? { retryAt: checkedAt + backoffDelay(failures2) } : {},
+              failures: failures2
+            };
+          }
+          const failures = limited && !attemptedKinds.length ? cache.failures + 1 : 0;
+          const retryAt = limited && !attemptedKinds.length ? checkedAt + backoffDelay(failures) : void 0;
           nextCache = quotaCache({
             reports: cache.reports,
             updatedAt: cache.updatedAt,
             checkedAt,
             retryAt,
             failures,
+            providerRefresh: providerRefresh2,
             error: message2
           });
           nextState = stateFromCache(nextCache);
           if (notify) {
+            const nextRetryAt = retryAt ?? Math.min(
+              ...attemptedKinds.map((kind) => providerRefresh2[kind]?.retryAt).filter((value) => value !== void 0)
+            );
             toast = {
               variant: limited ? "warning" : "error",
-              message: limited && retryAt ? `Rate limited; retry after ${retryLabel(retryAt)}` : message2
+              message: limited && Number.isFinite(nextRetryAt) ? `Rate limited; retry after ${retryLabel(nextRetryAt)}` : message2
             };
           }
         }

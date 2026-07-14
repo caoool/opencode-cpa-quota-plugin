@@ -20,12 +20,21 @@ export type QuotaReport = {
   error?: string
 }
 
+export type ProviderRefresh = {
+  checkedAt?: number
+  retryAt?: number
+  failures: number
+}
+
+export type ProviderRefreshState = Partial<Record<ProviderKind, ProviderRefresh>>
+
 export type QuotaCache = {
   reports: QuotaReport[]
   updatedAt?: number
   checkedAt?: number
   retryAt?: number
   failures: number
+  providerRefresh?: ProviderRefreshState
   error?: string
 }
 
@@ -135,6 +144,29 @@ function quotaReport(value: unknown): QuotaReport | undefined {
   }
 }
 
+function providerRefresh(value: unknown): ProviderRefresh | undefined {
+  const source = record(value)
+  const checkedAt = number(source.checkedAt)
+  const retryAt = number(source.retryAt)
+  const failures = Math.max(0, Math.floor(number(source.failures) ?? 0))
+  if (checkedAt === undefined && retryAt === undefined && failures === 0) return undefined
+  return {
+    ...(checkedAt === undefined ? {} : { checkedAt }),
+    ...(retryAt === undefined ? {} : { retryAt }),
+    failures,
+  }
+}
+
+function providerRefreshState(value: unknown): ProviderRefreshState | undefined {
+  const source = record(value)
+  const result: ProviderRefreshState = {}
+  for (const kind of ["codex", "claude", "grok"] as const) {
+    const refresh = providerRefresh(source[kind])
+    if (refresh) result[kind] = refresh
+  }
+  return Object.keys(result).length ? result : undefined
+}
+
 /** Normalize both legacy KV values and schema-v1 file payloads into display-only cache data. */
 export function quotaCache(value: unknown): QuotaCache {
   const source = record(value)
@@ -145,6 +177,7 @@ export function quotaCache(value: unknown): QuotaCache {
   const checkedAt = number(source.checkedAt)
   const retryAt = number(source.retryAt)
   const failures = Math.max(0, Math.floor(number(source.failures) ?? 0))
+  const providerRefresh = providerRefreshState(source.providerRefresh)
   const error = cacheError(source.error)
   return {
     reports,
@@ -152,6 +185,7 @@ export function quotaCache(value: unknown): QuotaCache {
     ...(checkedAt === undefined ? {} : { checkedAt }),
     ...(retryAt === undefined ? {} : { retryAt }),
     failures,
+    ...(providerRefresh ? { providerRefresh } : {}),
     ...(error ? { error } : {}),
   }
 }
@@ -165,6 +199,7 @@ function diskCache(value: unknown) {
     ...(cache.checkedAt === undefined ? {} : { checkedAt: cache.checkedAt }),
     ...(cache.retryAt === undefined ? {} : { retryAt: cache.retryAt }),
     failures: cache.failures,
+    ...(cache.providerRefresh ? { providerRefresh: cache.providerRefresh } : {}),
     ...(cache.error ? { error: cache.error } : {}),
   }
 }
@@ -337,6 +372,7 @@ export class SharedQuotaStore {
       checkedAt: source.checkedAt,
       retryAt: source.retryAt,
       failures: source.failures,
+      providerRefresh: source.providerRefresh,
       error: source.error,
     })
   }

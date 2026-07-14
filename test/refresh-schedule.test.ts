@@ -2,7 +2,10 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   clampRefreshMs,
+  dueProviderRefreshes,
+  latestRefreshAt,
   MIN_REFRESH_MS,
+  nextProviderRefreshDelay,
   nextRefreshDelay,
   selectMissingCacheFallback,
   sharedCacheDisplayStatus,
@@ -104,6 +107,60 @@ test("runs promptly when cached data is already stale", () => {
 
 test("bounds refresh delay when the system clock moves backwards", () => {
   assert.equal(nextRefreshDelay(400_000, 300_000, 100_000), 300_000 + TIMER_SLACK_MS)
+})
+
+test("a rate-limited provider does not block refreshes for the other providers", () => {
+  const now = 1_000_000
+  const kinds = ["codex", "claude", "grok"] as const
+  const refresh = {
+    codex: { checkedAt: now - 300_000 },
+    claude: { checkedAt: now - 300_000, retryAt: now + 600_000 },
+    grok: { checkedAt: now - 300_000 },
+  }
+
+  assert.deepEqual(dueProviderRefreshes({ kinds, refresh, refreshMs: 300_000, now }), ["codex", "grok"])
+  assert.deepEqual(dueProviderRefreshes({ kinds, refresh, refreshMs: 300_000, now, force: true }), [
+    "codex",
+    "grok",
+  ])
+})
+
+test("provider scheduling wakes for a healthy provider before a longer rate-limit delay", () => {
+  const now = 1_000_000
+  const kinds = ["codex", "claude", "grok"] as const
+  const refresh = {
+    codex: { checkedAt: now - 299_000 },
+    claude: { checkedAt: now, retryAt: now + 600_000 },
+    grok: { checkedAt: now - 298_000 },
+  }
+
+  assert.equal(nextProviderRefreshDelay({ kinds, refresh, refreshMs: 300_000, now }), 1_250)
+})
+
+test("a completed healthy-provider refresh moves only its own next due time", () => {
+  const now = 1_000_000
+  const kinds = ["codex", "claude"] as const
+  const refresh = {
+    codex: { checkedAt: now },
+    claude: { checkedAt: now - 300_000, retryAt: now + 600_000 },
+  }
+
+  assert.deepEqual(dueProviderRefreshes({ kinds, refresh, refreshMs: 300_000, now }), [])
+  assert.equal(nextProviderRefreshDelay({ kinds, refresh, refreshMs: 300_000, now }), 300_250)
+})
+
+test("retries a provider as soon as its backoff expires even before the normal refresh interval", () => {
+  const now = 1_000_000
+  const kinds = ["claude"] as const
+  const refresh = { claude: { checkedAt: now - 60_000, retryAt: now } }
+
+  assert.deepEqual(dueProviderRefreshes({ kinds, refresh, refreshMs: 300_000, now }), ["claude"])
+  assert.equal(nextProviderRefreshDelay({ kinds, refresh, refreshMs: 300_000, now }), TIMER_SLACK_MS)
+})
+
+test("the displayed refresh time follows the most recently checked provider", () => {
+  assert.equal(latestRefreshAt([1_000, 3_000, undefined, 2_000]), 3_000)
+  assert.equal(latestRefreshAt([undefined]), undefined)
 })
 
 test("adopts a newer shared-cache result from another process", () => {

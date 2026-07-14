@@ -6,7 +6,10 @@ import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plug
 import { createMemo, createSignal, For, Show } from "solid-js"
 import {
   clampRefreshMs,
+  dueProviderRefreshes,
+  latestRefreshAt,
   nextRefreshDelay,
+  nextProviderRefreshDelay,
   selectMissingCacheFallback,
   sharedCacheDisplayStatus,
   shouldAdoptCache,
@@ -20,6 +23,7 @@ import {
   LeaseLostError,
   quotaCache,
   type ProviderKind,
+  type ProviderRefreshState,
   type QuotaCache,
   type QuotaReport,
   type QuotaWindow,
@@ -59,6 +63,7 @@ const LEGACY_CACHE_KEY = "cpa-quota-sidebar.cache.v2"
 const SHARED_SYNC_MS = 5_000
 const STORAGE_RETRY_MS = 5_000
 const LOCK_RETRY_MS = 1_000
+const PROVIDER_KINDS = ["codex", "claude", "grok"] as const satisfies readonly ProviderKind[]
 const PROVIDER_ORDER: Record<ProviderKind, number> = { codex: 0, claude: 1, grok: 2 }
 const PLAN_KEYS = new Set([
   "plan",
@@ -98,6 +103,35 @@ function rateLimited(value: string | undefined) {
   return Boolean(value && /(?:429|rate[ -]?limit)/i.test(value))
 }
 
+function providerRefreshState(cache: QuotaCache): ProviderRefreshState {
+  const result: ProviderRefreshState = {}
+  for (const kind of PROVIDER_KINDS) {
+    const current = cache.providerRefresh?.[kind]
+    if (current) {
+      result[kind] = { ...current }
+      continue
+    }
+    const reports = cache.reports.filter((report) => report.kind === kind)
+    if (!reports.length) continue
+    const limited = reports.some((report) => rateLimited(report.error))
+    const checkedAt = cache.checkedAt ?? cache.updatedAt
+    result[kind] = {
+      ...(checkedAt === undefined ? {} : { checkedAt }),
+      ...(limited && cache.retryAt !== undefined ? { retryAt: cache.retryAt } : {}),
+      failures: limited ? cache.failures : 0,
+    }
+  }
+  return result
+}
+
+function trackedProviderKinds(cache: QuotaCache, refresh = providerRefreshState(cache)) {
+  const kinds = new Set<ProviderKind>(cache.reports.map((report) => report.kind))
+  for (const kind of PROVIDER_KINDS) {
+    if (refresh[kind]) kinds.add(kind)
+  }
+  return PROVIDER_KINDS.filter((kind) => kinds.has(kind))
+}
+
 function cachedReport(report: QuotaReport, previous: QuotaReport[]) {
   const exact = previous.find((item) => item.kind === report.kind && item.account === report.account)
   if (exact?.windows.length) return exact
@@ -111,6 +145,13 @@ function mergeReports(reports: QuotaReport[], previous: QuotaReport[]) {
     const cached = cachedReport(report, previous)
     return cached ? { ...cached, plan: report.plan ?? cached.plan, error: report.error } : report
   })
+}
+
+function mergeRefreshedReports(reports: QuotaReport[], previous: QuotaReport[], refreshedKinds: Set<ProviderKind>) {
+  return [
+    ...previous.filter((report) => !refreshedKinds.has(report.kind)),
+    ...mergeReports(reports, previous),
+  ]
 }
 
 function clampPercent(value: unknown): number | undefined {
@@ -482,7 +523,12 @@ async function fetchGrok(file: AuthFile, baseURL: string, key: string, timeoutMs
   }
 }
 
-async function fetchReports(baseURL: string, key: string, timeoutMs: number): Promise<QuotaReport[]> {
+async function fetchReports(
+  baseURL: string,
+  key: string,
+  timeoutMs: number,
+  kinds?: ReadonlySet<ProviderKind>,
+): Promise<{ reports: QuotaReport[]; supportedKinds: Set<ProviderKind> }> {
   const auth = await requestJSON<Record<string, unknown>>(
     `${baseURL}/v0/management/auth-files`,
     { headers: { Authorization: `Bearer ${key}` } },
@@ -491,8 +537,9 @@ async function fetchReports(baseURL: string, key: string, timeoutMs: number): Pr
   const files = Array.isArray(auth.files) ? (auth.files as AuthFile[]) : []
   const supported = files.map((file) => ({ file, kind: providerKind(file) })).filter((item) => item.kind)
   if (!supported.length) throw new Error("no supported CPA auth files")
-  return Promise.all(
-    supported.map(async ({ file, kind }) => {
+  const selected = kinds ? supported.filter(({ kind }) => kind && kinds.has(kind)) : supported
+  const reports = await Promise.all(
+    selected.map(async ({ file, kind }) => {
       try {
         if (kind === "codex") return await fetchCodex(file, baseURL, key, timeoutMs)
         if (kind === "claude") return await fetchClaude(file, baseURL, key, timeoutMs)
@@ -507,6 +554,10 @@ async function fetchReports(baseURL: string, key: string, timeoutMs: number): Pr
       }
     }),
   )
+  return {
+    reports,
+    supportedKinds: new Set(supported.map(({ kind }) => kind!)),
+  }
 }
 
 function QuotaView(props: {
@@ -644,7 +695,10 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   }
 
   const configuredStatus = () => (!baseURL ? "missing-base-url" : !key ? "missing-key" : "ready") as QuotaState["status"]
-  const cacheVersion = (cache: Pick<QuotaCache, "checkedAt" | "updatedAt">) => cache.checkedAt ?? cache.updatedAt
+  const cacheVersion = (cache: QuotaCache) => {
+    const providerChecks = Object.values(cache.providerRefresh ?? {}).map((refresh) => refresh?.checkedAt)
+    return latestRefreshAt([cache.updatedAt, cache.checkedAt, ...providerChecks])
+  }
   const stateFromCache = (
     cache: QuotaCache,
     options: { error?: string; loadingWhenEmpty?: boolean } = {},
@@ -670,7 +724,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       status,
       reports: cache.reports,
       updatedAt: cache.updatedAt,
-      checkedAt: cache.checkedAt,
+      checkedAt: cacheVersion(cache),
       error,
     }
   }
@@ -718,6 +772,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         checkedAt: cache.checkedAt ?? current.checkedAt,
         retryAt: cache.retryAt,
         failures: cache.failures,
+        providerRefresh: cache.providerRefresh ?? latestCache.providerRefresh,
         error: cache.error,
       })
     }
@@ -734,9 +789,53 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const backoffDelay = (failures: number) =>
     Math.min(MAX_BACKOFF_MS, backoffMs * 2 ** Math.min(8, Math.max(0, failures - 1)))
 
+  const refreshTargets = (cache: QuotaCache, now: number, force: boolean) => {
+    const providerRefresh = providerRefreshState(cache)
+    const kinds = trackedProviderKinds(cache, providerRefresh)
+    if (!kinds.length) return undefined
+    return new Set(
+      dueProviderRefreshes({
+        kinds,
+        refresh: providerRefresh,
+        refreshMs,
+        now,
+        force,
+      }),
+    )
+  }
+
+  const targetsAdvanced = (
+    before: QuotaCache,
+    after: QuotaCache,
+    targets: ReadonlySet<ProviderKind> | undefined,
+  ) => {
+    if (!targets) {
+      return (cacheVersion(after) ?? Number.NEGATIVE_INFINITY) > (cacheVersion(before) ?? Number.NEGATIVE_INFINITY)
+    }
+    if (targets.size === 0) return false
+    const beforeRefresh = providerRefreshState(before)
+    const afterRefresh = providerRefreshState(after)
+    return [...targets].every(
+      (kind) =>
+        (afterRefresh[kind]?.checkedAt ?? Number.NEGATIVE_INFINITY) >
+        (beforeRefresh[kind]?.checkedAt ?? Number.NEGATIVE_INFINITY),
+    )
+  }
+
   const scheduleFromCache = (cache: QuotaCache, now = Date.now()) => {
     if (!automaticPolling) {
       scheduleRefresh(SHARED_SYNC_MS)
+      return
+    }
+    const providerRefresh = providerRefreshState(cache)
+    const kinds = trackedProviderKinds(cache, providerRefresh)
+    if (kinds.length) {
+      scheduleRefresh(
+        Math.min(
+          SHARED_SYNC_MS,
+          nextProviderRefreshDelay({ kinds, refresh: providerRefresh, refreshMs, now }),
+        ),
+      )
       return
     }
     if (cache.retryAt && cache.retryAt > now) {
@@ -775,11 +874,20 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     setState(stateFromCache(latestCache, { loadingWhenEmpty: true }))
   }
 
-  const showRetryToast = (retryAt: number) => {
+  const showRetryToast = (cache: QuotaCache, now = Date.now()) => {
+    const providerRefresh = providerRefreshState(cache)
+    const retries = trackedProviderKinds(cache, providerRefresh)
+      .map((kind) => ({ kind, retryAt: providerRefresh[kind]?.retryAt }))
+      .filter((item): item is { kind: ProviderKind; retryAt: number } => Boolean(item.retryAt && item.retryAt > now))
+    const message = retries.length
+      ? retries.map(({ kind, retryAt }) => `${providerTitle(kind)} ${retryLabel(retryAt)}`).join(" · ")
+      : cache.retryAt && cache.retryAt > now
+        ? retryLabel(cache.retryAt)
+        : "later"
     api.ui.toast({
       variant: "warning",
       title: "CPA quota",
-      message: `Rate limited; retry after ${retryLabel(retryAt)}`,
+      message: `Rate limited; retry ${message}`,
     })
   }
 
@@ -822,8 +930,9 @@ const tui: TuiPlugin = async (api, rawOptions) => {
 
       const allowUpstream = notify || automaticPolling
       const needsCoordination = storageProbeRequired || migrationPending || sharedMissing
-      const beforeLockVersion = cacheVersion(cache)
+      const beforeLockCache = cache
       const now = Date.now()
+      const beforeTargets = refreshTargets(cache, now, notify)
 
       if (!needsCoordination) {
         if (!baseURL || !key) {
@@ -835,15 +944,19 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           scheduleRefresh(SHARED_SYNC_MS)
           return
         }
-        if (cache.retryAt && cache.retryAt > now) {
+        if (!beforeTargets && cache.retryAt && cache.retryAt > now) {
           scheduleFromCache(cache, now)
-          if (notify) showRetryToast(cache.retryAt)
+          if (notify) showRetryToast(cache, now)
           return
         }
-        const retryDue = cache.retryAt !== undefined && cache.retryAt <= now
         const lastCheck = cacheVersion(cache)
-        if (!notify && !retryDue && lastCheck && now - lastCheck < refreshMs) {
+        if (!beforeTargets && !notify && lastCheck && now - lastCheck < refreshMs) {
           scheduleFromCache(cache, now)
+          return
+        }
+        if (beforeTargets?.size === 0) {
+          scheduleFromCache(cache, now)
+          if (notify) showRetryToast(cache, now)
           return
         }
       }
@@ -931,24 +1044,29 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         }
 
         const lockedNow = Date.now()
-        if (cache.retryAt && cache.retryAt > lockedNow) {
+        const lockedTargets = refreshTargets(cache, lockedNow, notify)
+        if (!lockedTargets && cache.retryAt && cache.retryAt > lockedNow) {
           scheduleFromCache(cache, lockedNow)
-          if (notify) showRetryToast(cache.retryAt)
+          if (notify) showRetryToast(cache, lockedNow)
           return
         }
-        const retryDue = cache.retryAt !== undefined && cache.retryAt <= lockedNow
         const lockedVersion = cacheVersion(cache)
-        if (notify && lockedVersion !== undefined && lockedVersion > (beforeLockVersion ?? Number.NEGATIVE_INFINITY)) {
+        if (!lockedTargets && !notify && lockedVersion && lockedNow - lockedVersion < refreshMs) {
+          scheduleFromCache(cache, lockedNow)
+          return
+        }
+        if (lockedTargets?.size === 0) {
+          scheduleFromCache(cache, lockedNow)
+          if (notify) showRetryToast(cache, lockedNow)
+          return
+        }
+        if (notify && targetsAdvanced(beforeLockCache, cache, beforeTargets)) {
           scheduleFromCache(cache, lockedNow)
           api.ui.toast({
             variant: "success",
             title: "CPA quota",
             message: "Usage was refreshed by another OpenCode process",
           })
-          return
-        }
-        if (!notify && !retryDue && lockedVersion && lockedNow - lockedVersion < refreshMs) {
-          scheduleFromCache(cache, lockedNow)
           return
         }
 
@@ -961,31 +1079,58 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           | undefined
 
         try {
-          const fetched = (await fetchReports(baseURL, key, timeoutMs)).map((report) => ({
+          const fetchedResult = await fetchReports(baseURL, key, timeoutMs, lockedTargets)
+          const fetched = fetchedResult.reports.map((report) => ({
             ...report,
             plan: displayPlan(report.kind, report.plan, planLabels[report.kind]),
           }))
           if (api.lifecycle.signal.aborted) return
-          const limited = fetched.filter((report) => rateLimited(report.error))
-          const failures = limited.length ? cache.failures + 1 : 0
-          const retryAt = limited.length ? Date.now() + backoffDelay(failures) : undefined
+          const checkedAt = Date.now()
+          const refreshedKinds = lockedTargets ?? new Set<ProviderKind>(PROVIDER_KINDS)
+          const providerRefresh = providerRefreshState(cache)
+          for (const kind of refreshedKinds) {
+            if (!fetchedResult.supportedKinds.has(kind)) {
+              delete providerRefresh[kind]
+              continue
+            }
+            const providerReports = fetched.filter((report) => report.kind === kind)
+            const limited = providerReports.some((report) => rateLimited(report.error))
+            const failures = limited ? (providerRefresh[kind]?.failures ?? 0) + 1 : 0
+            providerRefresh[kind] = {
+              checkedAt,
+              ...(limited ? { retryAt: checkedAt + backoffDelay(failures) } : {}),
+              failures,
+            }
+          }
           const displayFetched = fetched.map((report) =>
-            rateLimited(report.error) && retryAt
-              ? { ...report, error: `Rate limited · retry ${retryLabel(retryAt)}` }
+            rateLimited(report.error) && providerRefresh[report.kind]?.retryAt
+              ? { ...report, error: `Rate limited · retry ${retryLabel(providerRefresh[report.kind]!.retryAt!)}` }
               : report,
           )
-          const reports = mergeReports(displayFetched, cache.reports)
-          const complete = fetched.every((report) => !report.error)
-          const checkedAt = Date.now()
-          const updatedAt = complete ? checkedAt : (cache.updatedAt ?? checkedAt)
-          nextCache = quotaCache({ reports, updatedAt, checkedAt, retryAt, failures })
+          const reports = mergeRefreshedReports(displayFetched, cache.reports, refreshedKinds)
+          const updatedAt = fetched.some((report) => !report.error) ? checkedAt : (cache.updatedAt ?? checkedAt)
+          nextCache = quotaCache({ reports, updatedAt, checkedAt, failures: 0, providerRefresh })
           nextState = stateFromCache(nextCache)
           if (notify) {
-            const cached = limited.every((report) => Boolean(cachedReport(report, cache.reports)))
+            const limitedKinds = PROVIDER_KINDS.filter((kind) =>
+              fetched.some((report) => report.kind === kind && rateLimited(report.error)),
+            )
+            const refreshed = PROVIDER_KINDS.filter((kind) =>
+              fetched.some((report) => report.kind === kind && !report.error),
+            )
+            const cached = fetched
+              .filter((report) => rateLimited(report.error))
+              .every((report) => Boolean(cachedReport(report, cache.reports)))
             toast = {
-              variant: limited.length ? "warning" : "success",
-              message: limited.length
-                ? `${limited.map((report) => providerTitle(report.kind)).join(", ")} rate limited; ${cached ? "showing cached usage" : `retry after ${retryLabel(retryAt!)}`}`
+              variant: limitedKinds.length ? "warning" : "success",
+              message: limitedKinds.length
+                ? `${limitedKinds.map(providerTitle).join(", ")} rate limited; ${
+                    refreshed.length
+                      ? `${refreshed.map(providerTitle).join(", ")} refreshed`
+                      : cached
+                        ? "showing cached usage"
+                        : "retry scheduled"
+                  }`
                 : "Usage refreshed",
             }
           }
@@ -993,22 +1138,43 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           if (api.lifecycle.signal.aborted) return
           const message = error instanceof Error ? error.message : "Quota refresh failed"
           const limited = rateLimited(message)
-          const failures = limited ? cache.failures + 1 : cache.failures
-          const retryAt = limited ? Date.now() + backoffDelay(failures) : undefined
           const checkedAt = Date.now()
+          const providerRefresh = providerRefreshState(cache)
+          const attemptedKinds = lockedTargets ? [...lockedTargets] : trackedProviderKinds(cache, providerRefresh)
+          for (const kind of attemptedKinds) {
+            const failures = limited ? (providerRefresh[kind]?.failures ?? 0) + 1 : 0
+            providerRefresh[kind] = {
+              checkedAt,
+              ...(limited ? { retryAt: checkedAt + backoffDelay(failures) } : {}),
+              failures,
+            }
+          }
+          const failures = limited && !attemptedKinds.length ? cache.failures + 1 : 0
+          const retryAt = limited && !attemptedKinds.length ? checkedAt + backoffDelay(failures) : undefined
           nextCache = quotaCache({
             reports: cache.reports,
             updatedAt: cache.updatedAt,
             checkedAt,
             retryAt,
             failures,
+            providerRefresh,
             error: message,
           })
           nextState = stateFromCache(nextCache)
           if (notify) {
+            const nextRetryAt =
+              retryAt ??
+              Math.min(
+                ...attemptedKinds
+                  .map((kind) => providerRefresh[kind]?.retryAt)
+                  .filter((value): value is number => value !== undefined),
+              )
             toast = {
               variant: limited ? "warning" : "error",
-              message: limited && retryAt ? `Rate limited; retry after ${retryLabel(retryAt)}` : message,
+              message:
+                limited && Number.isFinite(nextRetryAt)
+                  ? `Rate limited; retry after ${retryLabel(nextRetryAt)}`
+                  : message,
             }
           }
         }
