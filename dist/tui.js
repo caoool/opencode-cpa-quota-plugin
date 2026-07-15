@@ -749,6 +749,16 @@ function clampPercent(value) {
   if (result === void 0) return void 0;
   return Math.min(100, Math.max(0, result));
 }
+function boolFlag(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "on"].includes(trimmed)) return true;
+    if (["false", "0", "no", "n", "off"].includes(trimmed)) return false;
+  }
+  return void 0;
+}
 function normalizeBaseURL(value) {
   return value.trim().replace(/\/+$/, "").replace(/\/v1$/i, "");
 }
@@ -945,22 +955,49 @@ function claudeWindow(body, id, label) {
   if (used === void 0) return void 0;
   return { id, label, used, resetAt: resetTimestamp(value.resets_at ?? value.reset_at ?? value.resetsAt) };
 }
+function claudePlan(profile) {
+  const account = record2(profile.account);
+  const organization = record2(profile.organization);
+  const hasMax = boolFlag(account.has_claude_max ?? account.hasClaudeMax);
+  if (hasMax) return "Max";
+  const hasPro = boolFlag(account.has_claude_pro ?? account.hasClaudePro);
+  if (hasPro) return "Pro";
+  const organizationType = string2(organization.organization_type ?? organization.organizationType)?.toLowerCase();
+  const subscriptionStatus = string2(organization.subscription_status ?? organization.subscriptionStatus)?.toLowerCase();
+  if (organizationType === "claude_team" && subscriptionStatus === "active") return "Team";
+  if (hasMax === false && hasPro === false) return "Free";
+  return void 0;
+}
 async function fetchClaude(file, baseURL, key, timeoutMs) {
   const index = authIndex(file);
   if (!index) throw new Error("missing auth index");
-  const result = await managementCall({
-    baseURL,
-    key,
-    authIndex: index,
-    timeoutMs,
-    method: "GET",
-    url: "https://api.anthropic.com/api/oauth/usage",
-    headers: {
-      Authorization: "Bearer $TOKEN$",
-      "Content-Type": "application/json",
-      "anthropic-beta": "oauth-2025-04-20"
-    }
-  });
+  const headers = {
+    Authorization: "Bearer $TOKEN$",
+    "Content-Type": "application/json",
+    "anthropic-beta": "oauth-2025-04-20"
+  };
+  const [usage, profile] = await Promise.allSettled([
+    managementCall({
+      baseURL,
+      key,
+      authIndex: index,
+      timeoutMs,
+      method: "GET",
+      url: "https://api.anthropic.com/api/oauth/usage",
+      headers
+    }),
+    managementCall({
+      baseURL,
+      key,
+      authIndex: index,
+      timeoutMs,
+      method: "GET",
+      url: "https://api.anthropic.com/api/oauth/profile",
+      headers
+    })
+  ]);
+  if (usage.status === "rejected") throw usage.reason;
+  const result = usage.value;
   const windows = [
     claudeWindow(result.body, "five_hour", "5h"),
     claudeWindow(result.body, "seven_day", "7d"),
@@ -968,10 +1005,11 @@ async function fetchClaude(file, baseURL, key, timeoutMs) {
     claudeWindow(result.body, "seven_day_opus", "Opus 7d")
   ].filter((item) => Boolean(item));
   if (!windows.length) throw new Error("quota windows unavailable");
+  const plan = (profile.status === "fulfilled" ? claudePlan(profile.value.body) : void 0) ?? planLabel(result.body, result.headers, file);
   return {
     kind: "claude",
     account: accountLabel(file),
-    plan: planLabel(result.body, result.headers, file),
+    plan,
     windows
   };
 }
@@ -1011,10 +1049,13 @@ async function fetchGrok(file, baseURL, key, timeoutMs) {
   const windows = [];
   const weeklyUsed = clampPercent(weeklyBody.creditUsagePercent ?? weeklyBody.credit_usage_percent);
   const period = record2(weeklyBody.currentPeriod ?? weeklyBody.current_period);
+  const periodType = string2(period.type)?.toLowerCase() ?? "";
+  const products = Array.isArray(weeklyBody.productUsage ?? weeklyBody.product_usage) ? weeklyBody.productUsage ?? weeklyBody.product_usage : [];
   if (weeklyUsed !== void 0) {
     windows.push({ id: "weekly", label: "Week", used: weeklyUsed, resetAt: resetTimestamp(period.end) });
+  } else if (periodType.includes("weekly") && !products.length) {
+    windows.push({ id: "weekly", label: "Week", used: 0, resetAt: resetTimestamp(period.end) });
   }
-  const products = Array.isArray(weeklyBody.productUsage ?? weeklyBody.product_usage) ? weeklyBody.productUsage ?? weeklyBody.product_usage : [];
   for (const raw of products.slice(0, 2)) {
     const product = record2(raw);
     const used = clampPercent(product.usagePercent ?? product.usage_percent);

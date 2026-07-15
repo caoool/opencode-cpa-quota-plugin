@@ -162,6 +162,17 @@ function clampPercent(value: unknown): number | undefined {
   return Math.min(100, Math.max(0, result))
 }
 
+function boolFlag(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value === "number") return value !== 0
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase()
+    if (["true", "1", "yes", "y", "on"].includes(trimmed)) return true
+    if (["false", "0", "no", "n", "off"].includes(trimmed)) return false
+  }
+  return undefined
+}
+
 function normalizeBaseURL(value: string) {
   return value.trim().replace(/\/+$/, "").replace(/\/v1$/i, "")
 }
@@ -393,22 +404,50 @@ function claudeWindow(body: Record<string, unknown>, id: string, label: string):
   return { id, label, used, resetAt: resetTimestamp(value.resets_at ?? value.reset_at ?? value.resetsAt) }
 }
 
+function claudePlan(profile: Record<string, unknown>): string | undefined {
+  const account = record(profile.account)
+  const organization = record(profile.organization)
+  const hasMax = boolFlag(account.has_claude_max ?? account.hasClaudeMax)
+  if (hasMax) return "Max"
+  const hasPro = boolFlag(account.has_claude_pro ?? account.hasClaudePro)
+  if (hasPro) return "Pro"
+  const organizationType = string(organization.organization_type ?? organization.organizationType)?.toLowerCase()
+  const subscriptionStatus = string(organization.subscription_status ?? organization.subscriptionStatus)?.toLowerCase()
+  if (organizationType === "claude_team" && subscriptionStatus === "active") return "Team"
+  if (hasMax === false && hasPro === false) return "Free"
+  return undefined
+}
+
 async function fetchClaude(file: AuthFile, baseURL: string, key: string, timeoutMs: number): Promise<QuotaReport> {
   const index = authIndex(file)
   if (!index) throw new Error("missing auth index")
-  const result = await managementCall({
-    baseURL,
-    key,
-    authIndex: index,
-    timeoutMs,
-    method: "GET",
-    url: "https://api.anthropic.com/api/oauth/usage",
-    headers: {
-      Authorization: "Bearer $TOKEN$",
-      "Content-Type": "application/json",
-      "anthropic-beta": "oauth-2025-04-20",
-    },
-  })
+  const headers = {
+    Authorization: "Bearer $TOKEN$",
+    "Content-Type": "application/json",
+    "anthropic-beta": "oauth-2025-04-20",
+  }
+  const [usage, profile] = await Promise.allSettled([
+    managementCall({
+      baseURL,
+      key,
+      authIndex: index,
+      timeoutMs,
+      method: "GET",
+      url: "https://api.anthropic.com/api/oauth/usage",
+      headers,
+    }),
+    managementCall({
+      baseURL,
+      key,
+      authIndex: index,
+      timeoutMs,
+      method: "GET",
+      url: "https://api.anthropic.com/api/oauth/profile",
+      headers,
+    }),
+  ])
+  if (usage.status === "rejected") throw usage.reason
+  const result = usage.value
   const windows = [
     claudeWindow(result.body, "five_hour", "5h"),
     claudeWindow(result.body, "seven_day", "7d"),
@@ -416,10 +455,11 @@ async function fetchClaude(file: AuthFile, baseURL: string, key: string, timeout
     claudeWindow(result.body, "seven_day_opus", "Opus 7d"),
   ].filter((item): item is QuotaWindow => Boolean(item))
   if (!windows.length) throw new Error("quota windows unavailable")
+  const plan = (profile.status === "fulfilled" ? claudePlan(profile.value.body) : undefined) ?? planLabel(result.body, result.headers, file)
   return {
     kind: "claude",
     account: accountLabel(file),
-    plan: planLabel(result.body, result.headers, file),
+    plan,
     windows,
   }
 }
@@ -460,12 +500,15 @@ async function fetchGrok(file: AuthFile, baseURL: string, key: string, timeoutMs
   const windows: QuotaWindow[] = []
   const weeklyUsed = clampPercent(weeklyBody.creditUsagePercent ?? weeklyBody.credit_usage_percent)
   const period = record(weeklyBody.currentPeriod ?? weeklyBody.current_period)
-  if (weeklyUsed !== undefined) {
-    windows.push({ id: "weekly", label: "Week", used: weeklyUsed, resetAt: resetTimestamp(period.end) })
-  }
+  const periodType = string(period.type)?.toLowerCase() ?? ""
   const products = Array.isArray(weeklyBody.productUsage ?? weeklyBody.product_usage)
     ? ((weeklyBody.productUsage ?? weeklyBody.product_usage) as unknown[])
     : []
+  if (weeklyUsed !== undefined) {
+    windows.push({ id: "weekly", label: "Week", used: weeklyUsed, resetAt: resetTimestamp(period.end) })
+  } else if (periodType.includes("weekly") && !products.length) {
+    windows.push({ id: "weekly", label: "Week", used: 0, resetAt: resetTimestamp(period.end) })
+  }
   for (const raw of products.slice(0, 2)) {
     const product = record(raw)
     const used = clampPercent(product.usagePercent ?? product.usage_percent)
