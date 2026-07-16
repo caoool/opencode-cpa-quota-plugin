@@ -1,6 +1,6 @@
 {
   "name": "opencode-cpa-quota-plugin",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "OpenCode TUI sidebar plugin for Codex, Claude, and Grok subscription quotas through CLI Proxy API.",
   "keywords": [
     "opencode",

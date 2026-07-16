@@ -968,6 +968,12 @@ function claudePlan(profile) {
   if (hasMax === false && hasPro === false) return "Free";
   return void 0;
 }
+function grokPlan(monthlyBody) {
+  const limit = number3(record2(monthlyBody.monthlyLimit ?? monthlyBody.monthly_limit).val);
+  if (limit === 15e3) return "SuperGrok";
+  if (limit === 15e4) return "SuperGrok Heavy";
+  return void 0;
+}
 async function fetchClaude(file, baseURL, key, timeoutMs) {
   const index = authIndex(file);
   if (!index) throw new Error("missing auth index");
@@ -1074,16 +1080,17 @@ async function fetchGrok(file, baseURL, key, timeoutMs) {
     });
   }
   if (!windows.length) throw new Error("quota windows unavailable");
+  const plan = grokPlan(monthlyBody) ?? planLabel(
+    weeklyBody,
+    monthlyBody,
+    weekly.status === "fulfilled" ? weekly.value.headers : void 0,
+    monthly.status === "fulfilled" ? monthly.value.headers : void 0,
+    file
+  );
   return {
     kind: "grok",
     account: accountLabel(file),
-    plan: planLabel(
-      weeklyBody,
-      monthlyBody,
-      weekly.status === "fulfilled" ? weekly.value.headers : void 0,
-      monthly.status === "fulfilled" ? monthly.value.headers : void 0,
-      file
-    ),
+    plan,
     windows
   };
 }

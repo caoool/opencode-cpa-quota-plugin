@@ -418,6 +418,13 @@ function claudePlan(profile: Record<string, unknown>): string | undefined {
   return undefined
 }
 
+function grokPlan(monthlyBody: Record<string, unknown>): string | undefined {
+  const limit = number(record(monthlyBody.monthlyLimit ?? monthlyBody.monthly_limit).val)
+  if (limit === 15_000) return "SuperGrok"
+  if (limit === 150_000) return "SuperGrok Heavy"
+  return undefined
+}
+
 async function fetchClaude(file: AuthFile, baseURL: string, key: string, timeoutMs: number): Promise<QuotaReport> {
   const index = authIndex(file)
   if (!index) throw new Error("missing auth index")
@@ -527,16 +534,19 @@ async function fetchGrok(file: AuthFile, baseURL: string, key: string, timeoutMs
     })
   }
   if (!windows.length) throw new Error("quota windows unavailable")
-  return {
-    kind: "grok",
-    account: accountLabel(file),
-    plan: planLabel(
+  const plan =
+    grokPlan(monthlyBody) ??
+    planLabel(
       weeklyBody,
       monthlyBody,
       weekly.status === "fulfilled" ? weekly.value.headers : undefined,
       monthly.status === "fulfilled" ? monthly.value.headers : undefined,
       file,
-    ),
+    )
+  return {
+    kind: "grok",
+    account: accountLabel(file),
+    plan,
     windows,
   }
 }
