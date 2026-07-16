@@ -958,8 +958,12 @@ function claudeWindow(body, id, label) {
 function claudePlan(profile) {
   const account = record2(profile.account);
   const organization = record2(profile.organization);
+  const rateLimitTier = string2(organization.rate_limit_tier ?? organization.rateLimitTier)?.toLowerCase();
   const hasMax = boolFlag(account.has_claude_max ?? account.hasClaudeMax);
-  if (hasMax) return "Max";
+  if (hasMax) {
+    const multiplier = rateLimitTier?.match(/(\d+)x/)?.[1];
+    return multiplier ? `Max ${multiplier}x` : "Max";
+  }
   const hasPro = boolFlag(account.has_claude_pro ?? account.hasClaudePro);
   if (hasPro) return "Pro";
   const organizationType = string2(organization.organization_type ?? organization.organizationType)?.toLowerCase();

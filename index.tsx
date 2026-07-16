@@ -407,8 +407,12 @@ function claudeWindow(body: Record<string, unknown>, id: string, label: string):
 function claudePlan(profile: Record<string, unknown>): string | undefined {
   const account = record(profile.account)
   const organization = record(profile.organization)
+  const rateLimitTier = string(organization.rate_limit_tier ?? organization.rateLimitTier)?.toLowerCase()
   const hasMax = boolFlag(account.has_claude_max ?? account.hasClaudeMax)
-  if (hasMax) return "Max"
+  if (hasMax) {
+    const multiplier = rateLimitTier?.match(/(\d+)x/)?.[1]
+    return multiplier ? `Max ${multiplier}x` : "Max"
+  }
   const hasPro = boolFlag(account.has_claude_pro ?? account.hasClaudePro)
   if (hasPro) return "Pro"
   const organizationType = string(organization.organization_type ?? organization.organizationType)?.toLowerCase()
